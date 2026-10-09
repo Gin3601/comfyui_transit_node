@@ -77,25 +77,29 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 |---|---|---|
 | 文生视频 | 三个图口都不接 | 纯文字生成 |
 | 图生视频 / 首尾帧 | 接 `first_frame`（+ 可选 `last_frame`） | **ratio 必须设 adaptive** |
-| 多图参考 | 接 `reference_images`（多张） | 融合多图生成 |
-| **漫剧/真人感人物** | `图像合并`(勾选 `do_upload`) → `asset_ids` → 视频节点 `asset_ids` | 一个节点搞定合并+素材，绕开真人检测 |
+| 多图参考（动漫/二次元） | 接 `reference_images`（多张） | 融合多图生成 |
+| **写实人物（AI 漫剧）** | 接 `reference_images` + **打开 `upload_images`** | **一键模式**，节点自动转素材绕开真人检测 |
 
-## 写实人物（AI 漫剧）推荐接法
+## 写实人物（AI 漫剧）—— 一键模式
 
-写实人脸会被上游真人检测拦（base64 ❌、公网 URL ❌，只有素材库 ✅），所以：
+写实人脸会被上游真人检测拦（base64 ❌、公网 URL ❌，只有素材引用能过）。以前要手动接线绕，
+现在**打开一个开关就行**：
 
 ```
 [加载图像] ─┐
-            ├→ [CYAI 图像合并]  ← 勾选 do_upload，填 api_key
-[加载图像] ─┘        │
-                     ├─ asset_ids (STRING) ──→ [CYAI Seedance 视频生成].asset_ids
-                     └─ images    (IMAGE) ──→ （不需要，留空）
+            ├→ [CYAI 图像合并] ──images──→ [CYAI Seedance 视频生成] → [保存视频]
+[加载图像] ─┘                              ↑ 打开 upload_images，填 api_key
 ```
 
-- **一个节点搞定**：合并 + 上传素材，不必再接「CYAI 上传素材」。
-- `do_upload` 不勾时，行为与原来完全一致（只合并输出 IMAGE）。
-- 上传用的是**归一前的原图**（保留原始构图，不引入白边）。
-- 想单独上传单张/已有 URL 时，才用 `CYAI/Asset` 下的「CYAI 上传素材」。
+**只要做两步**：
+1. 视频节点 **`upload_images` 打开**
+2. 填 **`api_key`**
+
+节点内部自动：把 `reference_images` / `first_frame` 收到的图 → 上传成素材 → 改用 `asset://` 引用。
+**不需要接 `asset_ids` 那根线。**
+
+> 与「图像合并的 `do_upload`」的区别：`do_upload` 是**在合并节点里**上传并把 ID 从 `asset_ids` 口吐出（需要你再接一根线到视频节点）；
+> 视频节点的 `upload_images` 是**在视频节点里**上传，**零接线**。二选一即可，别两头都开（会重复上传）。
 
 ## 真人认证 / 素材流程
 

@@ -518,7 +518,34 @@ class CYAiSeedanceVideo:
                 # 插在中间会让旧工作流整体错位一格（曾把 image_max_side 冲成 80）。
                 "asset_ids": (
                     "STRING",
-                    {"default": "", "tooltip": "可选：素材 ID（逗号分隔），按 asset://<id> 引用。接「图像合并」的 asset_ids 输出；与首尾帧互斥"},
+                    {"default": "", "tooltip": "可选：素材 ID（逗号分隔），按 asset://<id> 引用。一般是接「图像合并」的 asset_ids 输出；若开了 upload_images 则由节点自己生成"},
+                ),
+                "upload_images": (
+                    "BOOLEAN",
+                    {"default": False,
+                     "tooltip": "一键模式：自动把接进来的图上传成素材并引用，绕开真人检测（会额外消耗一次素材上传）"},
+                ),
+                "image_host": (
+                    ["uguu", "catbox"],
+                    {"default": "uguu", "tooltip": "upload_images 开启时用的免费图床"},
+                ),
+                "asset_group_id": (
+                    "STRING",
+                    {"default": "", "tooltip": "upload_images 开启时：素材组 ID，留空自动建 AIGC 组"},
+                ),
+                "asset_name": (
+                    "STRING",
+                    {"default": "", "tooltip": "upload_images 开启时：素材名称，留空自动取名"},
+                ),
+                "upload_max_side": (
+                    "INT",
+                    {"default": 2048, "min": 300, "max": 6000, "step": 64,
+                     "tooltip": "upload_images 开启时：上传图最长边"},
+                ),
+                "upload_quality": (
+                    "INT",
+                    {"default": 90, "min": 30, "max": 100, "step": 5,
+                     "tooltip": "upload_images 开启时：上传图 JPEG 质量"},
                 ),
             },
         }
@@ -558,6 +585,12 @@ class CYAiSeedanceVideo:
         video_url_field="content.video_url|video_url|data.output|data.video_url",
         done_statuses="succeeded,completed,success,done",
         fail_statuses="failed,error,cancelled,canceled",
+        upload_images=False,
+        image_host="uguu",
+        asset_group_id="",
+        asset_name="",
+        upload_max_side=2048,
+        upload_quality=90,
     ):
         api_key = (api_key or "").strip()
         prompt = (prompt or "").strip()
@@ -572,6 +605,30 @@ class CYAiSeedanceVideo:
 
         # 模式互斥校验
         has_frames = first_frame is not None or last_frame is not None
+
+        # 一键模式：把接进来的图自动上传成素材，用 asset:// 引用（绕开真人检测）
+        if upload_images:
+            frames = []
+            for im in (first_frame, last_frame, reference_images):
+                if im is None:
+                    continue
+                t = im if im.dim() == 4 else im.unsqueeze(0)
+                frames.extend(t[i] for i in range(t.shape[0]))
+            if not frames:
+                raise ValueError(
+                    "upload_images 已开启，但没有接任何图。请把图接到 "
+                    "reference_images（或 first_frame）后再开启；"
+                    "若已有素材 ID，请直接填 asset_ids 并把 upload_images 关掉。"
+                )
+            auto_ids, _gid = _upload_frames_to_assets(
+                frames, base, api_key, asset_name, image_host, "Image",
+                "default", asset_group_id, "", upload_max_side, upload_quality,
+                poll_interval, max_wait)
+            # 自动上传后改为「素材引用」模式：清空首尾帧，避免与 base64 混传
+            first_frame = last_frame = reference_images = None
+            asset_ids = ",".join(filter(None, [asset_ids, auto_ids]))
+            has_frames = False
+
         has_refs = reference_images is not None or bool(_split_ids(asset_ids))
         if has_frames and has_refs:
             raise ValueError("首帧/尾帧模式与多图参考(reference_images / asset_ids)互斥，只能选一种")
