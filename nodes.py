@@ -133,9 +133,20 @@ def _resolve_url(base: str, url_or_path: str) -> str:
 
 
 def _split_ids(value) -> list[str]:
-    """把逗号/空格/换行分隔的 ID 串拆成列表，去空白去空项。"""
+    """把 ID 归一成列表。接受：逗号/空格分隔的字符串、或 ComfyUI 传来的 list。
+
+    ComfyUI 把上游 STRING 输出接到 STRING 输入时可能只传第一个元素，
+    也可能传整个 list，这里两种都兼容。
+    """
     import re
-    return [t for t in re.split(r"[,，\s]+", str(value or "").strip()) if t]
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        out = []
+        for v in value:
+            out.extend(_split_ids(v))
+        return out
+    return [t for t in re.split(r"[,，\s]+", str(value).strip()) if t]
 
 
 def _friendly_privacy_error(text: str) -> str | None:
@@ -1018,11 +1029,11 @@ class CYAiCreateAsset:
         }
 
     RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("asset_id", "group_id")
-    OUTPUT_TOOLTIPS = ("素材 ID（Status 已 Active，可填进视频节点的 asset_ids）", "所属素材组 ID（可复用）")
+    RETURN_NAMES = ("asset_ids", "group_id")
+    OUTPUT_TOOLTIPS = ("素材 ID（多张则逗号分隔，直接接视频节点的 asset_ids）", "所属素材组 ID（可复用）")
     FUNCTION = "create_asset"
     CATEGORY = "CYAI/Asset"
-    DESCRIPTION = "本地图→图床→素材（或直接给 URL），轮询到 Active；group_id 留空自动建 AIGC 组"
+    DESCRIPTION = "本地图(batch)→图床→素材（或直接给 URL），轮询到 Active；输出逗号分隔的 asset_ids"
 
     def create_asset(self, api_key, base_url, name, image_host="uguu", asset_type="Image",
                      project_name="default", poll_interval=5, max_wait=300,
@@ -1038,14 +1049,6 @@ class CYAiCreateAsset:
         if not name:
             raise ValueError("name 不能为空，请填写素材名称")
 
-        # 图片来源：优先 url；否则把本地图上传图床
-        if not url:
-            if image is None:
-                raise ValueError("请连接 image 输入（本地图）或在 url 填公网地址，二者必填其一")
-            img_bytes = _jpeg_bytes_from_image(
-                image, max_side=int(upload_max_side), quality=int(upload_quality))
-            url = _upload_to_host(img_bytes, "cyai_%d.jpg" % int(time.time()), provider=image_host)
-
         # group_id 留空 -> 自动创建 AIGC 素材组
         if not group_id:
             group_payload = {
@@ -1058,35 +1061,57 @@ class CYAiCreateAsset:
             if not group_id:
                 raise RuntimeError("自动创建素材组失败，响应里没有 Id：%s" % group_result)
 
-        result = _ark_action(base_url, api_key, "CreateAsset", {
-            "GroupId": group_id,
-            "Name": name,
-            "URL": url,
-            "AssetType": asset_type,
-            "ProjectName": project_name,
-        }, timeout=120.0)
-        asset_id = result.get("Id") or ""
-        if not asset_id:
-            raise RuntimeError("创建素材失败，响应里没有 Id：%s" % result)
+        # 收集待上传来源：优先 url；否则把本地图的每一帧都上传（支持 batch 多张）
+        urls = []
+        if url:
+            urls.append(url)
+        elif image is not None:
+            frames = image if image.dim() == 4 else image.unsqueeze(0)
+            total = frames.shape[0]
+            for i in range(total):
+                img_bytes = _jpeg_bytes_from_image(
+                    frames[i], max_side=int(upload_max_side), quality=int(upload_quality))
+                urls.append(_upload_to_host(
+                    img_bytes, "cyai_%d_%d.jpg" % (int(time.time()), i), provider=image_host))
+        else:
+            raise ValueError("请连接 image 输入（本地图）或在 url 填公网地址，二者必填其一")
 
-        # 轮询 GetAsset 直到 Active / Failed
+        # 每个 URL 建一个素材，轮询到 Active；输出逗号分隔的 asset_id 串
+        asset_ids = []
+        for idx, u in enumerate(urls):
+            asset_name = name if len(urls) == 1 else "%s-%d" % (name, idx + 1)
+            result = _ark_action(base_url, api_key, "CreateAsset", {
+                "GroupId": group_id,
+                "Name": asset_name,
+                "URL": u,
+                "AssetType": asset_type,
+                "ProjectName": project_name,
+            }, timeout=120.0)
+            asset_id = result.get("Id") or ""
+            if not asset_id:
+                raise RuntimeError("创建素材失败，响应里没有 Id：%s" % result)
+            asset_ids.append(asset_id)
+
+        # 轮询 GetAsset 直到全部 Active / 任一 Failed
+        pending = set(asset_ids)
         deadline = time.time() + float(max_wait)
         detail = None
-        while time.time() < deadline:
+        while pending and time.time() < deadline:
             comfy.model_management.throw_exception_if_processing_interrupted()
-            detail = _ark_action(base_url, api_key, "GetAsset", {
-                "Id": asset_id,
-                "ProjectName": project_name,
-            }, timeout=60.0)
-            status = str(detail.get("Status") or "").lower()
-            if status == "active":
-                return (asset_id, group_id)
-            if status == "failed":
-                err = detail.get("Error") or {}
-                raise RuntimeError(
-                    "素材处理失败：%s %s" % (err.get("Code") or "", err.get("Message") or "")
-                )
-            time.sleep(float(poll_interval))
-        raise RuntimeError(
-            "素材处理超时（%s 秒），最后状态：%s" % (int(max_wait), (detail or {}).get("Status") or "unknown")
-        )
+            for aid in list(pending):
+                detail = _ark_action(base_url, api_key, "GetAsset", {
+                    "Id": aid, "ProjectName": project_name}, timeout=60.0)
+                status = str(detail.get("Status") or "").lower()
+                if status == "active":
+                    pending.discard(aid)
+                elif status == "failed":
+                    err = detail.get("Error") or {}
+                    raise RuntimeError(
+                        "素材处理失败（%s）：%s %s" % (aid, err.get("Code") or "",
+                                                err.get("Message") or ""))
+            if pending:
+                time.sleep(float(poll_interval))
+        if pending:
+            raise RuntimeError("素材处理超时（%s 秒），未就绪：%s" % (int(max_wait), sorted(pending)))
+
+        return (",".join(asset_ids), group_id)
