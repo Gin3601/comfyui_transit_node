@@ -38,6 +38,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 import numpy as np
 import torch
@@ -66,12 +67,16 @@ DONE_STATUSES = {"SUCCEEDED"}
 FAIL_STATUSES = {"FAILED", "CANCELLED", "CANCELED"}
 
 
-def _image_to_data_uri(image: torch.Tensor, max_side: int = 1024, quality: int = 80) -> str:
+def _image_to_data_uri(image: torch.Tensor, max_side: int = 1024, quality: int = 80,
+                       min_side: int = 300) -> str:
     """把 ComfyUI 的 IMAGE 张量 [B,H,W,C] (0-1 float) 转成 base64 data URI。
 
     火山方舟要求单张图 <10MB、整个请求体 <64MB。参考图/首尾帧只需让模型看清
     主体与风格，无需原始分辨率，故默认限制最长边 1024、JPEG 质量 80；
     单张约 100-300KB，9 张约 1-3MB，远低于 64MB 上限。
+
+    另：接口要求**宽和高都 ≥300px**（实测宽度不足报
+    `expected the width to be at least 300px`），过小的图会被等比放大到 300px。
     """
     if image.dim() == 4:
         image = image[0]
@@ -82,6 +87,10 @@ def _image_to_data_uri(image: torch.Tensor, max_side: int = 1024, quality: int =
     w, h = pil.size
     if max(w, h) > max_side:
         scale = max_side / float(max(w, h))
+        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    w, h = pil.size
+    if min(w, h) < min_side:                      # 接口下限：宽高均需 ≥300px
+        scale = min_side / float(min(w, h))
         pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
     buf = io.BytesIO()
     pil.save(buf, format="JPEG", quality=quality)
@@ -123,6 +132,28 @@ def _resolve_url(base: str, url_or_path: str) -> str:
     return f"{base}/{url_or_path.lstrip('/')}"
 
 
+def _split_ids(value) -> list[str]:
+    """把逗号/空格/换行分隔的 ID 串拆成列表，去空白去空项。"""
+    import re
+    return [t for t in re.split(r"[,，\s]+", str(value or "").strip()) if t]
+
+
+def _friendly_privacy_error(text: str) -> str | None:
+    """把真人脸隐私拦截错误翻译成人话 + 修复指引；非该错误返回 None。"""
+    if "InputImageSensitiveContentDetected" in text or "may contain real person" in text:
+        return (
+            "输入图片被判定包含「真人」（真人脸隐私拦截，错误码 "
+            "InputImageSensitiveContentDetected.PrivacyInformation）。\n"
+            "doubao-seedance 不允许直接以 base64 图片传入真人面容，必须走真人认证素材流程：\n"
+            "  1. 用「CYAI 创建真人认证会话」拿到 H5Link，让本人完成活体认证；\n"
+            "  2. 用「CYAI 查询认证结果」轮询拿到真人素材组 GroupId；\n"
+            "  3. 用「CYAI 创建素材」把真人图片的公网 URL 上传到该组，轮询到 Active；\n"
+            "  4. 在视频节点里填 asset_ids 引用素材 ID，不要再接 first_frame / reference_images 传真人图。\n"
+            "若素材是 AI 生成的虚拟人像（非真人），改用 AIGC 素材组即可，无需真人认证。"
+        )
+    return None
+
+
 def _http_json(method: str, url: str, headers: dict, payload: dict | None = None, timeout: float = 60.0):
     """发送 HTTP 请求并解析 JSON，出错时抛出带响应内容的异常。"""
     data = None
@@ -135,8 +166,10 @@ def _http_json(method: str, url: str, headers: dict, payload: dict | None = None
             body = resp.read()
     except urllib.error.HTTPError as e:
         body = e.read()
+        text = body.decode("utf-8", "replace")
+        hint = _friendly_privacy_error(text)
         raise RuntimeError(
-            "API 请求失败 (HTTP %s)：%s" % (e.code, body[:1500].decode("utf-8", "replace"))
+            hint or ("API 请求失败 (HTTP %s)：%s" % (e.code, text[:1500]))
         ) from e
     except urllib.error.URLError as e:
         raise RuntimeError("无法连接到中转站 %s：%s" % (url, e.reason)) from e
@@ -168,6 +201,122 @@ def _video_from_bytes(video_bytes: bytes):
     """把 mp4 字节包装成 ComfyUI VIDEO 输出对象（延迟导入 comfy_api）。"""
     from comfy_api.latest import InputImpl
     return InputImpl.VideoFromFile(io.BytesIO(video_bytes))
+
+
+def _jpeg_bytes_from_image(image: torch.Tensor, max_side: int = 2048,
+                           quality: int = 90, min_side: int = 300) -> bytes:
+    """把 IMAGE 张量转成 JPEG 字节。用于上传公网图床。
+
+    素材接口要求宽度 300-6000px，这里保证：最长边 ≤ max_side，最短边 ≥ min_side。
+    """
+    if image.dim() == 4:
+        image = image[0]
+    arr = (image.clamp(0.0, 1.0).cpu().numpy() * 255.0).astype(np.uint8)
+    pil = Image.fromarray(arr)
+    if pil.mode == "RGBA":
+        bg = Image.new("RGB", pil.size, (255, 255, 255))
+        bg.paste(pil, mask=pil.getchannel("A"))
+        pil = bg
+    elif pil.mode != "RGB":
+        pil = pil.convert("RGB")
+
+    w, h = pil.size
+    if max(w, h) > max_side:                      # 太大：等比缩到最长边
+        s = max_side / float(max(w, h))
+        pil = pil.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
+    w, h = pil.size
+    if min(w, h) < min_side:                      # 太小：等比放大到最短边（素材接口 ≥300px）
+        s = min_side / float(min(w, h))
+        pil = pil.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
+        if min(pil.size) > 6000:                  # 放大后越过上限则回退原图
+            pil = Image.fromarray(arr).convert("RGB")
+
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def _upload_to_host(img_bytes: bytes, filename: str = "image.jpg",
+                    provider: str = "uguu", timeout: float = 60.0) -> str:
+    """把图片字节 POST 到公网图床，返回直链 URL。
+
+    只用免费匿名图床（无需账号/key）。返回的链接多为临时链接（数小时），
+    但素材接口会立即下载并转存到平台托管存储，因此足以完成「建素材」这一步。
+    """
+    boundary = "----CYAIUpload" + uuid.uuid4().hex
+    body = b""
+    if provider == "uguu":          # https://uguu.se  —— 匿名，返回 https://n.uguu.se/xxx.jpg
+        body += ("--%s\r\n" % boundary).encode()
+        body += ('Content-Disposition: form-data; name="files[]"; filename="%s"\r\n' % filename).encode()
+        body += b"Content-Type: image/jpeg\r\n\r\n"
+        body += img_bytes
+        body += ("\r\n--%s--\r\n" % boundary).encode()
+        url = "https://uguu.se/upload.php"
+    elif provider == "catbox":      # https://catbox.moe —— 匿名，永久链接（但机房 IP 常被拒）
+        body += ("--%s\r\n" % boundary).encode()
+        body += b'Content-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n'
+        body += ("--%s\r\n" % boundary).encode()
+        body += ('Content-Disposition: form-data; name="fileToUpload"; filename="%s"\r\n' % filename).encode()
+        body += b"Content-Type: image/jpeg\r\n\r\n"
+        body += img_bytes
+        body += ("\r\n--%s--\r\n" % boundary).encode()
+        url = "https://catbox.moe/user/api.php"
+    else:
+        raise ValueError("不支持的图床：%s" % provider)
+
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary,
+                 "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("图床上传失败 (HTTP %s)：%s" % (e.code, e.read()[:300].decode("utf-8", "replace"))) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError("图床不可达（%s）：%s；可换 image_host 再试" % (provider, e.reason)) from e
+
+    if provider == "uguu":
+        try:
+            data = json.loads(text)
+            link = (data.get("files") or [{}])[0].get("url") or ""
+        except json.JSONDecodeError:
+            link = ""
+    else:
+        link = text if text.startswith("http") else ""
+    if not link:
+        raise RuntimeError("图床上传未返回 URL：%s" % text[:300])
+    return link
+
+
+# 火山方舟素材资产接口（Action 兼容入口）常量
+ARK_VERSION = "2024-01-01"
+ARK_SERVICE = "ark"
+
+
+def _ark_action(base: str, api_key: str, action: str, payload: dict, timeout: float = 60.0):
+    """调用火山方舟素材资产接口（Action 兼容入口），返回 Result 对象。
+
+    统一 POST {base}/api/?Action=<action>&Version=2024-01-01，
+    鉴权 Authorization: Bearer <token>，无需 HMAC 签名。
+    响应为火山原生格式：
+      成功：{"ResponseMetadata": {...}, "Result": {...}}
+      失败：{"ResponseMetadata": {...}, "Error": {"Code": ..., "Message": ...}}
+    业务失败抛出 RuntimeError；成功返回 Result（可能为空 dict）。
+    """
+    url = "%s/api/?Action=%s&Version=%s" % (base.rstrip("/"), action, ARK_VERSION)
+    headers = {"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json"}
+    resp = _http_json("POST", url, headers, payload, timeout=timeout)
+    if not isinstance(resp, dict):
+        raise RuntimeError("%s 响应格式异常：%s" % (action, str(resp)[:800]))
+    err = resp.get("Error") or resp.get("error")
+    if isinstance(err, dict) and err:
+        raise RuntimeError(
+            "%s 失败：%s %s" % (action, err.get("Code") or err.get("code") or "",
+                               err.get("Message") or err.get("message") or "")
+        )
+    result = resp.get("Result")
+    return result if isinstance(result, dict) else {}
 
 
 def _resolve_field(data, dot_path: str):
@@ -304,6 +453,10 @@ class CYAiSeedanceVideo:
                     "IMAGE",
                     {"tooltip": "可选：多张参考图（role=reference_image，建议 1-4 张），与首尾帧互斥"},
                 ),
+                "asset_ids": (
+                    "STRING",
+                    {"default": "", "tooltip": "可选：真人/AIGC 素材 ID（逗号分隔），按 asset://<id> 引用，用于已认证的真人素材；与首尾帧互斥"},
+                ),
                 "poll_interval": (
                     "INT",
                     {"default": 10, "min": 1, "max": 60, "step": 1,
@@ -377,6 +530,7 @@ class CYAiSeedanceVideo:
         first_frame=None,
         last_frame=None,
         reference_images=None,
+        asset_ids="",
         poll_interval=10,
         max_wait=900,
         image_max_side=1024,
@@ -400,9 +554,9 @@ class CYAiSeedanceVideo:
 
         # 模式互斥校验
         has_frames = first_frame is not None or last_frame is not None
-        has_refs = reference_images is not None
+        has_refs = reference_images is not None or bool(_split_ids(asset_ids))
         if has_frames and has_refs:
-            raise ValueError("首帧/尾帧模式与多图参考(reference_images)互斥，只能选一种")
+            raise ValueError("首帧/尾帧模式与多图参考(reference_images / asset_ids)互斥，只能选一种")
 
         # 首尾帧模式要求 ratio=adaptive（火山方舟硬约束）
         if has_frames and ratio != "adaptive":
@@ -437,6 +591,15 @@ class CYAiSeedanceVideo:
                 content.append({
                     "type": "image_url",
                     "image_url": {"url": _image_to_data_uri(single, max_side=image_max_side, quality=image_quality)},
+                    "role": "reference_image",
+                })
+
+        # 素材引用：asset_ids 里每个 ID 生成一个 reference_image 项，按 11.5.5 用 asset://<id> 形式
+        if asset_ids:
+            for aid in _split_ids(asset_ids):
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": "asset://" + aid},
                     "role": "reference_image",
                 })
 
@@ -640,3 +803,290 @@ class CYAiImageBatch:
         # 又避免异形比例/透明图在 JPEG 里产生黑边污染参考图。
         normalized = [_uniform_square(f, int(max_side)) for f in frames]
         return (torch.cat(normalized, dim=0),)
+
+
+class CYAiCreateVerifySession:
+    """创建火山方舟真人认证会话（CreateVisualValidateSession）。
+
+    输出 H5Link（本人活体认证链接）与 BytedToken（查询结果用）。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
+                "callback_url": ("STRING", {"default": "", "tooltip": "真人认证完成后的回调地址（必填）"}),
+                "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("h5_link", "byted_token")
+    OUTPUT_TOOLTIPS = ("真人认证 H5 链接（发给本人完成活体认证）", "认证会话令牌（供查询认证结果使用）")
+    FUNCTION = "create_session"
+    CATEGORY = "CYAI/Asset"
+    DESCRIPTION = "创建火山方舟真人认证会话，输出 H5Link（活体认证）与 BytedToken"
+
+    def create_session(self, api_key, base_url, callback_url, project_name="default"):
+        api_key = (api_key or "").strip()
+        if not api_key:
+            raise ValueError("api_key 不能为空")
+        callback_url = (callback_url or "").strip()
+        if not callback_url:
+            raise ValueError("callback_url 不能为空，请填写认证完成后的回调地址")
+
+        result = _ark_action(base_url, api_key, "CreateVisualValidateSession", {
+            "CallbackURL": callback_url,
+            "ProjectName": (project_name or "default").strip(),
+        }, timeout=60.0)
+        token = result.get("BytedToken") or ""
+        link = result.get("H5Link") or ""
+        if not token:
+            raise RuntimeError("创建真人认证会话失败，响应里没有 BytedToken：%s" % result)
+        return (link, token)
+
+
+class CYAiGetVerifyResult:
+    """查询真人认证结果（GetVisualValidateResult），轮询直到拿到真人素材组 GroupId。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
+                "byted_token": ("STRING", {"default": "", "tooltip": "CreateVisualValidateSession 返回的 BytedToken"}),
+                "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
+                "poll_interval": ("INT", {"default": 10, "min": 1, "max": 60, "step": 1, "tooltip": "轮询间隔（秒）"}),
+                "max_wait": ("INT", {"default": 600, "min": 30, "max": 3600, "step": 1, "tooltip": "最长等待（秒），认证需本人操作，建议给足时间"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("group_id",)
+    OUTPUT_TOOLTIPS = ("真人认证对应的素材组 ID",)
+    FUNCTION = "get_result"
+    CATEGORY = "CYAI/Asset"
+    DESCRIPTION = "轮询查询真人认证结果，返回真人素材组 GroupId"
+
+    def get_result(self, api_key, base_url, byted_token, project_name="default",
+                   poll_interval=10, max_wait=600):
+        api_key = (api_key or "").strip()
+        byted_token = (byted_token or "").strip()
+        if not api_key:
+            raise ValueError("api_key 不能为空")
+        if not byted_token:
+            raise ValueError("byted_token 不能为空，请先创建真人认证会话")
+
+        payload = {"BytedToken": byted_token}
+        if (project_name or "").strip():
+            payload["ProjectName"] = (project_name or "").strip()
+
+        deadline = time.time() + float(max_wait)
+        last_err = ""
+        while time.time() < deadline:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            try:
+                result = _ark_action(base_url, api_key, "GetVisualValidateResult", payload, timeout=60.0)
+            except RuntimeError as e:
+                last_err = str(e)  # 认证未完成时上游可能报错，视为未就绪继续等
+            else:
+                group_id = result.get("GroupId") or ""
+                if group_id:
+                    return (group_id,)
+            time.sleep(float(poll_interval))
+        raise RuntimeError(
+            "真人认证结果查询超时（%s 秒），尚未拿到 GroupId；请确认本人已在 H5 链接完成认证。最后错误：%s"
+            % (int(max_wait), last_err or "无")
+        )
+
+
+class CYAiAssetGroup:
+    """素材组节点（火山方舟素材资产接口）。
+
+    action 单选：
+      - 创建素材组（AIGC 虚拟人像）：CreateAssetGroup → 返回 group_id
+      - 查询素材组列表：ListAssetGroups → 返回列表文本
+      - 查询素材组详情：GetAssetGroup → 返回详情文本
+    AIGC 组用于托管虚拟人像素材（动漫/漫剧/插画/AI 生成角色），
+    上传后的素材可在视频任务里用 asset://<id> 引用，绕开 base64 真人检测。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
+                "action": (
+                    ["创建素材组（AIGC）", "查询素材组列表", "查询素材组详情"],
+                    {"default": "创建素材组（AIGC）", "tooltip": "选择要执行的操作"},
+                ),
+                "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
+            },
+            "optional": {
+                "name": ("STRING", {"default": "", "tooltip": "创建：素材组名称（必填，建议 ≤64 字符）"}),
+                "description": ("STRING", {"default": "", "tooltip": "创建：素材组描述（可选）"}),
+                "group_type": ("STRING", {"default": "AIGC", "tooltip": "创建：素材组类型。AIGC=虚拟人像；真人素材组须走真人认证流程"}),
+                "group_id": ("STRING", {"default": "", "tooltip": "查询详情：素材组 ID"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("group_id", "info")
+    OUTPUT_TOOLTIPS = ("创建成功/详情查询的素材组 ID（可接「上传素材」的 group_id）", "列表或详情文本")
+    FUNCTION = "run"
+    CATEGORY = "CYAI/Asset"
+    DESCRIPTION = "素材组操作：创建 AIGC 虚拟人像组 / 查询列表 / 查询详情"
+
+    def run(self, api_key, base_url, action, project_name="default",
+            name="", description="", group_type="AIGC", group_id=""):
+        api_key = (api_key or "").strip()
+        project_name = (project_name or "default").strip()
+        if not api_key:
+            raise ValueError("api_key 不能为空")
+
+        if action == "创建素材组（AIGC）":
+            name = (name or "").strip()
+            if not name:
+                raise ValueError("name 不能为空，请填写素材组名称")
+            payload = {"Name": name, "ProjectName": project_name, "GroupType": group_type or "AIGC"}
+            if description:
+                payload["Description"] = description
+            result = _ark_action(base_url, api_key, "CreateAssetGroup", payload, timeout=60.0)
+            gid = result.get("Id") or ""
+            if not gid:
+                raise RuntimeError("创建素材组失败，响应里没有 Id：%s" % result)
+            return (gid, "创建成功：%s（%s）" % (gid, name))
+
+        if action == "查询素材组列表":
+            # Filter 必填（可为空对象），否则上游报 Filter is required
+            result = _ark_action(base_url, api_key, "ListAssetGroups", {
+                "Filter": {"GroupType": group_type} if group_type else {},
+                "PageNumber": 1, "PageSize": 20, "ProjectName": project_name,
+            }, timeout=60.0)
+            items = result.get("Items") or []
+            lines = ["素材组共 %s 个：" % result.get("TotalCount", len(items))]
+            for it in items:
+                lines.append("  %s  %s  %s" % (it.get("Id"), it.get("GroupType"), it.get("Name")))
+            return ("", "\n".join(lines))
+
+        # 查询素材组详情
+        group_id = (group_id or "").strip()
+        if not group_id:
+            raise ValueError("group_id 不能为空，请填写要查询的素材组 ID")
+        result = _ark_action(base_url, api_key, "GetAssetGroup", {
+            "Id": group_id, "ProjectName": project_name}, timeout=60.0)
+        return (result.get("Id") or group_id, json.dumps(result, ensure_ascii=False, indent=2))
+
+
+class CYAiCreateAsset:
+    """创建素材（CreateAsset + 轮询 GetAsset 到 Active）。
+
+    图片来源二选一：
+      - 接 image 输入（本地图）→ 自动上传公网图床拿 URL → 创建素材（全自动，推荐）
+      - 或直接填 url（已经有公网链接时）
+    group_id 留空时自动创建 AIGC 素材组。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
+                "name": ("STRING", {"default": "", "tooltip": "素材名称（必填）"}),
+                "image_host": (
+                    ["uguu", "catbox"],
+                    {"default": "uguu", "tooltip": "自动上传用的免费匿名图床：uguu 稳定但链接数小时失效；catbox 永久但机房 IP 常被拒"},
+                ),
+                "asset_type": (["Image", "Video", "Audio"], {"default": "Image", "tooltip": "素材类型，需与真实文件一致"}),
+                "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
+                "poll_interval": ("INT", {"default": 5, "min": 1, "max": 60, "step": 1, "tooltip": "轮询间隔（秒）"}),
+                "max_wait": ("INT", {"default": 300, "min": 30, "max": 1800, "step": 1, "tooltip": "最长等待（秒）"}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "要上传的本地图（接「图像合并」的输出）→ 自动传图床拿 URL"}),
+                "url": ("STRING", {"default": "", "tooltip": "已有公网 URL 时直接填这里（与 image 二选一，填了优先用 URL）"}),
+                "group_id": ("STRING", {"default": "", "tooltip": "可选：所属素材组 ID。留空则自动创建 AIGC 组；真人素材填认证结果给的 GroupId"}),
+                "group_name": ("STRING", {"default": "", "tooltip": "可选：group_id 留空时，自动创建素材组的名称"}),
+                "upload_max_side": ("INT", {"default": 2048, "min": 300, "max": 6000, "step": 64, "tooltip": "上传图最长边（素材接口上限 6000px）"}),
+                "upload_quality": ("INT", {"default": 90, "min": 30, "max": 100, "step": 5, "tooltip": "上传图 JPEG 质量"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("asset_id", "group_id")
+    OUTPUT_TOOLTIPS = ("素材 ID（Status 已 Active，可填进视频节点的 asset_ids）", "所属素材组 ID（可复用）")
+    FUNCTION = "create_asset"
+    CATEGORY = "CYAI/Asset"
+    DESCRIPTION = "本地图→图床→素材（或直接给 URL），轮询到 Active；group_id 留空自动建 AIGC 组"
+
+    def create_asset(self, api_key, base_url, name, image_host="uguu", asset_type="Image",
+                     project_name="default", poll_interval=5, max_wait=300,
+                     image=None, url="", group_id="", group_name="",
+                     upload_max_side=2048, upload_quality=90):
+        api_key = (api_key or "").strip()
+        name = (name or "").strip()
+        url = (url or "").strip()
+        group_id = (group_id or "").strip()
+        project_name = (project_name or "default").strip()
+        if not api_key:
+            raise ValueError("api_key 不能为空")
+        if not name:
+            raise ValueError("name 不能为空，请填写素材名称")
+
+        # 图片来源：优先 url；否则把本地图上传图床
+        if not url:
+            if image is None:
+                raise ValueError("请连接 image 输入（本地图）或在 url 填公网地址，二者必填其一")
+            img_bytes = _jpeg_bytes_from_image(
+                image, max_side=int(upload_max_side), quality=int(upload_quality))
+            url = _upload_to_host(img_bytes, "cyai_%d.jpg" % int(time.time()), provider=image_host)
+
+        # group_id 留空 -> 自动创建 AIGC 素材组
+        if not group_id:
+            group_payload = {
+                "Name": (group_name or "").strip() or ("auto-" + name)[:64],
+                "ProjectName": project_name,
+                "GroupType": "AIGC",
+            }
+            group_result = _ark_action(base_url, api_key, "CreateAssetGroup", group_payload, timeout=60.0)
+            group_id = group_result.get("Id") or ""
+            if not group_id:
+                raise RuntimeError("自动创建素材组失败，响应里没有 Id：%s" % group_result)
+
+        result = _ark_action(base_url, api_key, "CreateAsset", {
+            "GroupId": group_id,
+            "Name": name,
+            "URL": url,
+            "AssetType": asset_type,
+            "ProjectName": project_name,
+        }, timeout=120.0)
+        asset_id = result.get("Id") or ""
+        if not asset_id:
+            raise RuntimeError("创建素材失败，响应里没有 Id：%s" % result)
+
+        # 轮询 GetAsset 直到 Active / Failed
+        deadline = time.time() + float(max_wait)
+        detail = None
+        while time.time() < deadline:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            detail = _ark_action(base_url, api_key, "GetAsset", {
+                "Id": asset_id,
+                "ProjectName": project_name,
+            }, timeout=60.0)
+            status = str(detail.get("Status") or "").lower()
+            if status == "active":
+                return (asset_id, group_id)
+            if status == "failed":
+                err = detail.get("Error") or {}
+                raise RuntimeError(
+                    "素材处理失败：%s %s" % (err.get("Code") or "", err.get("Message") or "")
+                )
+            time.sleep(float(poll_interval))
+        raise RuntimeError(
+            "素材处理超时（%s 秒），最后状态：%s" % (int(max_wait), (detail or {}).get("Status") or "unknown")
+        )
