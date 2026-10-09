@@ -155,12 +155,17 @@ def _friendly_privacy_error(text: str) -> str | None:
         return (
             "输入图片被判定包含「真人」（真人脸隐私拦截，错误码 "
             "InputImageSensitiveContentDetected.PrivacyInformation）。\n"
-            "doubao-seedance 不允许直接以 base64 图片传入真人面容，必须走真人认证素材流程：\n"
-            "  1. 用「CYAI 创建真人认证会话」拿到 H5Link，让本人完成活体认证；\n"
-            "  2. 用「CYAI 查询认证结果」轮询拿到真人素材组 GroupId；\n"
-            "  3. 用「CYAI 创建素材」把真人图片的公网 URL 上传到该组，轮询到 Active；\n"
-            "  4. 在视频节点里填 asset_ids 引用素材 ID，不要再接 first_frame / reference_images 传真人图。\n"
-            "若素材是 AI 生成的虚拟人像（非真人），改用 AIGC 素材组即可，无需真人认证。"
+            "base64 和公网 URL 两种传法都会被扫，**只有「素材引用」能绕开**。\n"
+            "【最快检查】如果你已经用了「CYAI 图像合并」并勾选了 do_upload：\n"
+            "  很可能线接错了 —— 正确接法是接它的 **asset_ids 输出（第 2 个输出点）**\n"
+            "  到本节点的 **asset_ids 输入口**；\n"
+            "  而不该把它的 **images 输出（第 1 个点）** 接到 first_frame / reference_images。\n"
+            "【手动流程】若要自己建素材：\n"
+            "  1. 用「CYAI 上传素材」（或图像合并的 do_upload）把图变成素材，拿到 asset_id；\n"
+            "  2. 在本节点 asset_ids 里填该 ID（多个用逗号分隔）；\n"
+            "  3. 清空 first_frame / last_frame / reference_images。\n"
+            "【真人素材】真人面容需走活体认证：创建认证会话 → 本人认证 → 查询认证结果拿 GroupId →\n"
+            "  上传素材到该组 → 再用 asset_ids 引用。AI 生成的虚拟人像用 AIGC 组即可，无需认证。"
         )
     return None
 
