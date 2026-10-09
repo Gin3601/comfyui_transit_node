@@ -1,6 +1,6 @@
-# CYAI Seedance 视频生成节点（cyai.club 中转站）
+# CYAI Seedance 视频生成节点（中转站）
 
-在 ComfyUI 里调用 CYAI 中转站（`https://www.cyai.club`）的 `doubao-seedance` 系列视频模型。
+在 ComfyUI 里调用中转站的 `doubao-seedance` 系列视频模型。
 接口为火山方舟 Ark 原生格式（`/api/v3/contents/generations/tasks`）。
 
 ## 安装
@@ -21,7 +21,7 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 
 节点出现在 `CYAI/Seedance` 分类下：
 
-- **CYAI Seedance 视频生成 (cyai.club)** —— 生成视频，输出 VIDEO 对象
+- **CYAI Seedance 视频生成（中转站）** —— 生成视频，输出 VIDEO 对象
 - **CYAI 图像合并 (多图参考)** —— 把多张参考图归一成统一尺寸的 IMAGE batch
 
 ## 输出
@@ -35,7 +35,7 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 | 参数 | 说明 |
 |---|---|
 | `api_key` | 中转站 Key（`sk-xxx`） |
-| `base_url` | 默认 `https://www.cyai.club` |
+| `base_url` | 中转站地址（默认已预填，接入哪家就改哪家） |
 | `submit_url` | 提交任务的 POST 地址，默认 `/api/v3/contents/generations/tasks` |
 | `poll_url_template` | 查询任务的 GET 地址模板，默认 `/api/v3/contents/generations/tasks/{task_id}`，`{task_id}` 自动替换 |
 | `model` | `doubao-seedance-2-0-260128` / `2-0-fast-260128` / `2-0-mini-260615` / `2-5-260628` |
@@ -72,5 +72,5 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 - 视频 URL 为火山 TOS 临时签名链接，**24 小时有效**，节点会自动下载并包装成 VIDEO 对象。
 - 任务记录仅可查询最近 7 天。
 - 消耗计费依据为 `usage.completion_tokens`。
-- **余额无法通过该 key 经 API 查询**（`/api/user/self` 返回 invalid access token），请到 cyai.club 网页后台查看剩余额度。
+- 余额无法通过该 key 经 API 查询，请到中转站网页后台查看剩余额度。
 - 仅使用 ComfyUI 自带依赖（`torch`、`PIL`、`numpy`、`comfy_api` 和标准库 `urllib`），无需额外安装包。
