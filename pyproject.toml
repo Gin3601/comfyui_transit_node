@@ -10,7 +10,7 @@ dependencies = []
 Repository = "https://github.com/Gin3601/comfyui_transit_node"
 
 [tool.comfy]
-# PublisherId：在 https://registry.comfy.org 创建 publisher 后，把其 ID 填到这里（全局唯一，不可改）
-PublisherId = ""
+# PublisherId：在 https://registry.comfy.org 创建的 publisher ID（全局唯一，不可改）
+PublisherId = "gin3601"
 DisplayName = "CYAI Seedance 视频生成 (cyai.club)"
 Icon = ""
