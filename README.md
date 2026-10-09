@@ -14,7 +14,7 @@
 ### 方式二：手动
 
 ```bash
-git clone https://github.com/Gin3601/comfyui-cyai-seedance.git
+git clone https://github.com/Gin3601/comfyui_transit_node.git
 ```
 
 或直接把文件夹放进 `ComfyUI/custom_nodes/comfyui_transit_node/`，然后重启 ComfyUI。
