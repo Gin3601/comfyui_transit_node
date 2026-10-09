@@ -35,6 +35,8 @@ CYAI 中转站 —— doubao-seedance 视频生成节点（ComfyUI 自定义节�
 import base64
 import io
 import json
+import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -47,14 +49,6 @@ from PIL import Image
 # ComfyUI 进度与中断适配（节点只在 ComfyUI 内运行，这些模块必定存在）
 from comfy.utils import ProgressBar
 import comfy.model_management
-
-# 用户提供的模型列表（CYAI 中转站）
-MODEL_OPTIONS = [
-    "doubao-seedance-2-0-260128",
-    "doubao-seedance-2-0-fast-260128",
-    "doubao-seedance-2-0-mini-260615",
-    "doubao-seedance-2-5-260628",
-]
 
 RESOLUTION_OPTIONS = ["480p", "720p", "1080p"]
 RATIO_OPTIONS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"]
@@ -377,17 +371,208 @@ def _extract_status(state: dict, status_field: str) -> str:
     return str(v or "").upper()
 
 
-def _extract_error(state: dict) -> str | None:
-    """失败时返回 error.message（或 error.code），否则 None。"""
-    err = state.get("error")
-    if isinstance(err, dict):
-        return err.get("message") or err.get("code")
-    return None
+def _extract_error(state: dict, error_path: str = "error.message|error.code") -> str | None:
+    """失败时按可配路径返回错误信息（message/code），否则 None。"""
+    return _resolve_first(state, error_path)
 
 
 def _extract_video_url(state: dict, video_url_field: str):
     """按可配路径从查询结果取 mp4 地址（支持多路径兜底）。"""
     return _resolve_first(state, video_url_field)
+
+# ===== 协议配方（recipe）：把「提交/轮询/解析」的供应商差异抽成数据 =====
+
+ARK_SEEDANCE_RECIPE = {
+    "name": "ark_seedance",
+    "display_name": "火山方舟 doubao-seedance（Ark v3）",
+    "async": True,
+    "auth": {
+        "headers": {
+            "Authorization": "Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    },
+    "submit": {
+        "method": "POST",
+        "url": "{base_url}/api/v3/contents/generations/tasks",
+        "body": (
+            '{"model": {model}, "content": {content}, "resolution": {resolution}, '
+            '"ratio": {ratio}, "duration": {duration}, "generate_audio": {generate_audio}, '
+            '"watermark": {watermark}, "seed": {seed}, "return_last_frame": {return_last_frame}}'
+        ),
+    },
+    "poll_url_template": "{base_url}/api/v3/contents/generations/tasks/{task_id}",
+    "content_items": {
+        "text": '{"type": "text", "text": {prompt}}',
+        "first_frame": '{"type": "image_url", "image_url": {"url": {image}}, "role": "first_frame"}',
+        "last_frame": '{"type": "image_url", "image_url": {"url": {image}}, "role": "last_frame"}',
+        "reference_image": '{"type": "image_url", "image_url": {"url": {image}}, "role": "reference_image"}',
+        "asset": '{"type": "image_url", "image_url": {"url": {image}}, "role": "reference_image"}',
+    },
+    "task_id_path": "id|data.id|data.task_id|task_id",
+    "status_path": "status|data.status",
+    "video_url_path": "content.video_url|video_url|data.output|data.video_url",
+    "error_path": "error.message|error.code",
+    "done_statuses": ["succeeded", "completed", "success", "done"],
+    "fail_statuses": ["failed", "error", "cancelled", "canceled"],
+}
+
+
+def _json_str(value) -> str:
+    """把值序列化成 JSON 字符串字面量（带引号 + 转义），用于注入模板。"""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _render_template(template: str, values: dict) -> str:
+    """替换模板里的 {placeholder} 占位符；values 的键是占位符名，值须为已序列化字符串。
+
+    用正则一次性替换：未知占位符（如 {task_id}）保留原样留给运行时处理；
+    替换进去的值不会被二次扫描，避免内容里的花括号被误替换。
+    """
+    return re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), template)
+
+
+def _status_set(statuses) -> set:
+    """把状态词（list 或逗号分隔字符串）归一成小写集合。"""
+    if isinstance(statuses, (list, tuple)):
+        return {str(s).strip().lower() for s in statuses if str(s).strip()}
+    return {s.strip().lower() for s in str(statuses).split(",") if s.strip()}
+
+
+def _load_recipe(recipe):
+    """解析 recipe 字段：内置名 / 文件路径 / JSON 字符串；空返回 None（走 legacy）。"""
+    recipe = (recipe or "").strip()
+    if not recipe:
+        return None
+    if recipe == "ark_seedance":
+        return dict(ARK_SEEDANCE_RECIPE)
+    if os.path.isfile(recipe):
+        with open(recipe, encoding="utf-8") as f:
+            return json.load(f)
+    try:
+        return json.loads(recipe)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "recipe 无法解析：请填内置名 ark_seedance、或贴 recipe JSON、或填文件路径"
+        ) from None
+
+
+def _build_protocol_config(recipe, base, api_key, submit_url, poll_url_template,
+                           task_id_field, status_field, video_url_field,
+                           done_statuses, fail_statuses, prompt, model, resolution, ratio,
+                           duration, generate_audio, watermark, seed, return_last_frame):
+    """把 recipe（或旧显式字段）归一成统一的协议配置 dict。
+
+    recipe 提供时优先，缺失项回退到节点显式字段；无 recipe 时用旧字段构造
+    legacy 配置，行为与此前完全一致（向后兼容）。
+    """
+    r = _load_recipe(recipe)
+
+    if r:
+        auth_cfg = r.get("auth") or {}
+        headers_tpl = auth_cfg.get("headers") or {}
+        auth_headers = {k: _render_template(v, {"api_key": api_key})
+                        for k, v in headers_tpl.items()}
+        submit = r.get("submit") or {}
+        submit_method = submit.get("method", "POST")
+        submit_url_raw = submit.get("url") or DEFAULT_SUBMIT_URL
+        submit_url = _resolve_url(base, _render_template(submit_url_raw, {"base_url": base}))
+        body_template = submit.get("body") or "{}"
+        poll_tpl = r.get("poll_url_template") or DEFAULT_POLL_URL_TEMPLATE
+        poll_url_template = _resolve_url(
+            base, _render_template(poll_tpl, {"base_url": base}))
+        content_items = r.get("content_items") or {}
+        task_id_path = r.get("task_id_path") or task_id_field
+        status_path = r.get("status_path") or status_field
+        video_url_path = r.get("video_url_path") or video_url_field
+        error_path = r.get("error_path") or "error.message|error.code"
+        done_set = _status_set(r.get("done_statuses") or done_statuses)
+        fail_set = _status_set(r.get("fail_statuses") or fail_statuses)
+        is_async = bool(r.get("async", True))
+    else:
+        auth_headers = {
+            "Authorization": "Bearer %s" % api_key,
+            "Content-Type": "application/json",
+        }
+        submit_method = "POST"
+        submit_url = _resolve_url(base, submit_url or DEFAULT_SUBMIT_URL)
+        body_template = (
+            '{"model": {model}, "content": {content}, "resolution": {resolution}, '
+            '"ratio": {ratio}, "duration": {duration}, "generate_audio": {generate_audio}, '
+            '"watermark": {watermark}, "seed": {seed}, "return_last_frame": {return_last_frame}}'
+        )
+        poll_url_template = _resolve_url(base, (poll_url_template or DEFAULT_POLL_URL_TEMPLATE).strip())
+        content_items = {
+            "text": '{"type": "text", "text": {prompt}}',
+            "first_frame": '{"type": "image_url", "image_url": {"url": {image}}, "role": "first_frame"}',
+            "last_frame": '{"type": "image_url", "image_url": {"url": {image}}, "role": "last_frame"}',
+            "reference_image": '{"type": "image_url", "image_url": {"url": {image}}, "role": "reference_image"}',
+            "asset": '{"type": "image_url", "image_url": {"url": {image}}, "role": "reference_image"}',
+        }
+        task_id_path = task_id_field
+        status_path = status_field
+        video_url_path = video_url_field
+        error_path = "error.message|error.code"
+        done_set = _status_set(done_statuses)
+        fail_set = _status_set(fail_statuses)
+        is_async = True
+
+    body_values = {
+        "prompt": _json_str(prompt),
+        "model": _json_str(model),
+        "resolution": _json_str(resolution),
+        "ratio": _json_str(ratio),
+        "duration": str(int(duration)),
+        "seed": str(int(seed)),
+        "generate_audio": "true" if generate_audio else "false",
+        "watermark": "true" if watermark else "false",
+        "return_last_frame": "true" if return_last_frame else "false",
+    }
+
+    return {
+        "auth_headers": auth_headers,
+        "submit_method": submit_method,
+        "submit_url": submit_url,
+        "body_template": body_template,
+        "body_values": body_values,
+        "poll_url_template": poll_url_template,
+        "content_items": content_items,
+        "task_id_path": task_id_path,
+        "status_path": status_path,
+        "video_url_path": video_url_path,
+        "error_path": error_path,
+        "done_set": done_set,
+        "fail_set": fail_set,
+        "async": is_async,
+    }
+
+
+def _render_content(content_items, prompt, first_frame, last_frame, reference_images,
+                    asset_ids, image_max_side, image_quality):
+    """按 content_items 模板把文本/首尾帧/参考图/素材组装成 content JSON 数组字符串。"""
+    parts = []
+
+    def _item(tpl, **vals):
+        return _render_template(tpl, {k: _json_str(v) for k, v in vals.items()})
+
+    if prompt and "text" in content_items:
+        parts.append(_item(content_items["text"], prompt=prompt))
+    if first_frame is not None and "first_frame" in content_items:
+        uri = _image_to_data_uri(first_frame, max_side=image_max_side, quality=image_quality)
+        parts.append(_item(content_items["first_frame"], image=uri))
+    if last_frame is not None and "last_frame" in content_items:
+        uri = _image_to_data_uri(last_frame, max_side=image_max_side, quality=image_quality)
+        parts.append(_item(content_items["last_frame"], image=uri))
+    if reference_images is not None and "reference_image" in content_items:
+        ref = reference_images if reference_images.dim() == 4 else reference_images.unsqueeze(0)
+        for i in range(ref.shape[0]):
+            uri = _image_to_data_uri(ref[i], max_side=image_max_side, quality=image_quality)
+            parts.append(_item(content_items["reference_image"], image=uri))
+    if asset_ids and "asset" in content_items:
+        for aid in _split_ids(asset_ids):
+            parts.append(_item(content_items["asset"], image="asset://" + aid))
+
+    return "[" + ", ".join(parts) + "]"
 
 
 class CYAiSeedanceVideo:
@@ -399,7 +584,7 @@ class CYAiSeedanceVideo:
             "required": {
                 "api_key": (
                     "STRING",
-                    {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"},
+                    {"default": "", "tooltip": "中转站 API Key（sk-xxx）"},
                 ),
                 "base_url": (
                     "STRING",
@@ -416,8 +601,9 @@ class CYAiSeedanceVideo:
                      "tooltip": "查询任务的 GET 地址模板，{task_id} 会被替换"},
                 ),
                 "model": (
-                    MODEL_OPTIONS,
-                    {"default": "doubao-seedance-2-0-260128", "tooltip": "视频生成模型"},
+                    "STRING",
+                    {"default": "doubao-seedance-2-0-260128",
+                     "tooltip": "视频生成模型名（可自由输入任意模型；常见：doubao-seedance-2-0-260128 / 2-0-fast-260128 / 2-0-mini-260615 / 2-5-260628）"},
                 ),
                 "prompt": (
                     "STRING",
@@ -546,6 +732,11 @@ class CYAiSeedanceVideo:
                     {"default": 90, "min": 30, "max": 100, "step": 5,
                      "tooltip": "upload_images 开启时：上传图 JPEG 质量"},
                 ),
+                "recipe": (
+                    "STRING",
+                    {"default": "",
+                     "tooltip": "协议配方：内置名 ark_seedance（火山方舟 doubao-seedance），或贴 recipe JSON / 填文件路径接入其它视频 API。留空 = 用上方显式的提交/轮询/字段路径参数（旧行为）"},
+                ),
             },
         }
 
@@ -590,11 +781,12 @@ class CYAiSeedanceVideo:
         asset_name="",
         upload_max_side=2048,
         upload_quality=90,
+        recipe="",
     ):
         api_key = (api_key or "").strip()
         prompt = (prompt or "").strip()
         if not api_key:
-            raise ValueError("api_key 不能为空，请填写 CYAI 中转站的 sk-xxx")
+            raise ValueError("api_key 不能为空，请填写中转站的 sk-xxx")
         if not prompt:
             raise ValueError("prompt 不能为空")
 
@@ -636,72 +828,50 @@ class CYAiSeedanceVideo:
         if has_frames and ratio != "adaptive":
             raise ValueError("首帧/尾帧模式要求 ratio 必须设为 adaptive，请把画幅比例改为 adaptive")
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        # 解析协议配置（recipe 优先，旧显式字段兜底，向后兼容）
+        cfg = _build_protocol_config(
+            recipe, base, api_key, submit_url, poll_url_template,
+            task_id_field, status_field, video_url_field, done_statuses, fail_statuses,
+            prompt, model, resolution, ratio, duration, generate_audio, watermark,
+            seed, return_last_frame,
+        )
 
-        # 构造 content 数组
-        content = [{"type": "text", "text": prompt}]
-        if first_frame is not None:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": _image_to_data_uri(first_frame, max_side=image_max_side, quality=image_quality)},
-                "role": "first_frame",
-            })
-        if last_frame is not None:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": _image_to_data_uri(last_frame, max_side=image_max_side, quality=image_quality)},
-                "role": "last_frame",
-            })
-        if reference_images is not None:
-            ref = reference_images
-            if ref.dim() == 3:
-                ref = ref.unsqueeze(0)  # 单张 [H,W,C] -> batch [1,H,W,C]
-            n = ref.shape[0]
-            for i in range(n):
-                single = ref[i]
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": _image_to_data_uri(single, max_side=image_max_side, quality=image_quality)},
-                    "role": "reference_image",
-                })
+        headers = cfg["auth_headers"]
 
-        # 素材引用：asset_ids 里每个 ID 生成一个 reference_image 项，按 11.5.5 用 asset://<id> 形式
-        if asset_ids:
-            for aid in _split_ids(asset_ids):
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": "asset://" + aid},
-                    "role": "reference_image",
-                })
+        # 按 recipe 的 content_items 模板组装 content 数组
+        content_str = _render_content(
+            cfg["content_items"], prompt, first_frame, last_frame,
+            reference_images, asset_ids, image_max_side, image_quality)
 
-        body = {
-            "model": model,
-            "content": content,
-            "resolution": resolution,
-            "ratio": ratio,
-            "duration": int(duration),
-            "generate_audio": bool(generate_audio),
-            "watermark": bool(watermark),
-            "seed": int(seed),
-            "return_last_frame": bool(return_last_frame),
-        }
+        # 渲染 body 模板 -> 最终请求体
+        body_values = dict(cfg["body_values"])
+        body_values["content"] = content_str
+        body_str = _render_template(cfg["body_template"], body_values)
+        try:
+            body = json.loads(body_str)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                "请求体模板渲染后不是有效 JSON：%s；渲染结果：%s" % (e, body_str[:1500])) from e
 
-        submit_endpoint = _resolve_url(base, submit_url or DEFAULT_SUBMIT_URL)
-        created = _http_json("POST", submit_endpoint, headers, body, timeout=180.0)
+        created = _http_json(cfg["submit_method"], cfg["submit_url"], headers, body, timeout=180.0)
 
-        task_id = _extract_task_id(created, task_id_field)
+        task_id = _extract_task_id(created, cfg["task_id_path"])
         if not task_id:
-            raise RuntimeError("提交任务失败，响应里找不到任务 ID（路径 %s）：%s" % (task_id_field, created))
+            raise RuntimeError("提交任务失败，响应里找不到任务 ID（路径 %s）：%s"
+                               % (cfg["task_id_path"], created))
 
-        poll_template = (poll_url_template or DEFAULT_POLL_URL_TEMPLATE).strip()
-        poll_url = _resolve_url(base, poll_template.replace("{task_id}", str(task_id)))
+        # 同步接口：提交响应直接带视频地址，跳过轮询
+        if not cfg["async"]:
+            video_url = _extract_video_url(created, cfg["video_url_path"])
+            if not video_url:
+                raise RuntimeError("同步接口未返回视频地址（路径 %s）：%s"
+                                   % (cfg["video_url_path"], created))
+            return (_video_from_bytes(_download(video_url, headers)),)
 
-        # 状态词集合（小写归一）
-        done_set = {s.strip().lower() for s in str(done_statuses).split(",") if s.strip()}
-        fail_set = {s.strip().lower() for s in str(fail_statuses).split(",") if s.strip()}
+        poll_url = cfg["poll_url_template"].replace("{task_id}", str(task_id))
+
+        done_set = cfg["done_set"]
+        fail_set = cfg["fail_set"]
 
         deadline = time.time() + float(max_wait)
 
@@ -716,24 +886,24 @@ class CYAiSeedanceVideo:
             # 用户点击取消 / 中断时，让 ComfyUI 能真正停掉这个节点
             comfy.model_management.throw_exception_if_processing_interrupted()
 
-            status = _extract_status(last_state, status_field).lower()
+            status = _extract_status(last_state, cfg["status_path"]).lower()
 
             if status in fail_set:
-                err = _extract_error(last_state)
+                err = _extract_error(last_state, cfg["error_path"])
                 raise RuntimeError(
                     "视频生成任务失败：%s%s" % (err or "", "" if err else " %s" % (last_state,))
                 )
 
             if status in done_set:
-                video_url = _extract_video_url(last_state, video_url_field)
+                video_url = _extract_video_url(last_state, cfg["video_url_path"])
                 if not video_url:
                     raise RuntimeError(
-                        "任务已完成，但按路径 %s 未找到视频地址：%s" % (video_url_field, last_state)
+                        "任务已完成，但按路径 %s 未找到视频地址：%s"
+                        % (cfg["video_url_path"], last_state)
                     )
                 pbar.update(total_rounds)  # 完成，进度走满
                 video_bytes = _download(video_url, headers)
-                video = _video_from_bytes(video_bytes)
-                return (video,)
+                return (_video_from_bytes(video_bytes),)
 
             pbar.update(1)
 
@@ -758,7 +928,7 @@ class CYAiSeedanceUsage:
             "required": {
                 "api_key": (
                     "STRING",
-                    {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"},
+                    {"default": "", "tooltip": "中转站 API Key（sk-xxx）"},
                 ),
                 "base_url": (
                     "STRING",
@@ -782,7 +952,7 @@ class CYAiSeedanceUsage:
     def query(self, api_key, base_url, list_url):
         api_key = (api_key or "").strip()
         if not api_key:
-            raise ValueError("api_key 不能为空，请填写 CYAI 中转站的 sk-xxx")
+            raise ValueError("api_key 不能为空，请填写中转站的 sk-xxx")
 
         base = (base_url or "").strip().rstrip("/")
         if not base:
@@ -815,7 +985,7 @@ class CYAiSeedanceUsage:
                 total_tokens += int(usage.get("completion_tokens") or 0)
 
         lines = [
-            "CYAI 中转站任务消耗统计",
+            "中转站任务消耗统计",
             f"  历史任务总数：{total}",
             f"  成功：{succeeded}  失败：{failed}",
             f"  累计消耗：{total_tokens:,} tokens",
@@ -967,7 +1137,7 @@ class CYAiCreateVerifySession:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "api_key": ("STRING", {"default": "", "tooltip": "中转站 API Key（sk-xxx）"}),
                 "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
                 "callback_url": ("STRING", {"default": "", "tooltip": "真人认证完成后的回调地址（必填）"}),
                 "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
@@ -1007,7 +1177,7 @@ class CYAiGetVerifyResult:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "api_key": ("STRING", {"default": "", "tooltip": "中转站 API Key（sk-xxx）"}),
                 "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
                 "byted_token": ("STRING", {"default": "", "tooltip": "CreateVisualValidateSession 返回的 BytedToken"}),
                 "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
@@ -1070,7 +1240,7 @@ class CYAiAssetGroup:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "api_key": ("STRING", {"default": "", "tooltip": "中转站 API Key（sk-xxx）"}),
                 "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
                 "action": (
                     ["创建素材组（AIGC）", "查询素材组列表", "查询素材组详情"],
@@ -1147,7 +1317,7 @@ class CYAiCreateAsset:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_key": ("STRING", {"default": "", "tooltip": "CYAI 中转站 API Key（sk-xxx）"}),
+                "api_key": ("STRING", {"default": "", "tooltip": "中转站 API Key（sk-xxx）"}),
                 "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
                 "name": ("STRING", {"default": "", "tooltip": "素材名称（必填）"}),
                 "image_host": (

@@ -44,7 +44,7 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 | `base_url` | 中转站地址（默认已预填，接入哪家就改哪家） |
 | `submit_url` | 提交任务的 POST 地址，默认 `/api/v3/contents/generations/tasks` |
 | `poll_url_template` | 查询任务的 GET 地址模板，默认 `/api/v3/contents/generations/tasks/{task_id}`，`{task_id}` 自动替换 |
-| `model` | `doubao-seedance-2-0-260128` / `2-0-fast-260128` / `2-0-mini-260615` / `2-5-260628` |
+| `model` | 模型名（可自由输入任意模型；常见 `doubao-seedance-2-0-260128` / `2-0-fast-260128` / `2-0-mini-260615` / `2-5-260628`） |
 | `prompt` | 提示词 |
 | `duration` | 视频时长（秒），4-30。2.0 系列最大 10s，2.5 最大 30s |
 | `resolution` | 480p / 720p / 1080p（fast 系列不支持 1080p） |
@@ -53,9 +53,11 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 | `watermark` | 是否加 AI 水印 |
 | `seed` | 随机种子（-1 = 随机） |
 | `return_last_frame` | 是否返回最后一帧 |
+| `recipe` | 协议配方（可选，见下「通用配方」）。填内置名 `ark_seedance`，或贴 recipe JSON / 填文件路径接入其它视频 API；留空 = 用上方显式的提交/轮询/字段路径参数 |
 
 > `submit_url` / `poll_url_template` 支持相对路径（拼在 `base_url` 后）或完整 URL。
 > 中转站换接口地址时，直接在节点上改这两个字段即可，无需改代码重装。
+> 填了 `recipe` 后，配方的鉴权 / 提交地址 / 请求体 / 字段路径 / 状态词会覆盖上方显式参数（配方未提供的字段回退到显式参数）。
 
 可选输入（IMAGE）：
 
@@ -70,6 +72,58 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 | 输入口 | 说明 |
 |---|---|
 | `asset_ids` | 已上传的素材 ID（逗号分隔），按 `asset://<id>` 引用。真人素材必须走这条路，直接传图会触发真人脸隐私拦截 |
+
+## 通用配方（recipe）—— 接入任意视频 API
+
+视频节点默认按火山方舟 Ark 原生格式工作（`提交任务 → 轮询 → 下载` 骨架）。`recipe` 字段把
+「鉴权 / 提交地址 / 请求体 / 响应字段路径 / 状态词」这些**供应商差异**抽成一份 JSON 配方，
+接入别家视频 API 时只需填配方，不用改代码。
+
+### 配方字段
+
+| 键 | 说明 |
+|---|---|
+| `name` / `display_name` | 配方名（任意） |
+| `async` | 是否轮询。`false` = 同步接口，提交响应直接带视频地址 |
+| `auth.headers` | 鉴权头模板，`{api_key}` 会被替换（如 `Bearer {api_key}`） |
+| `submit.method` / `submit.url` | 提交任务的方法与地址模板（`{base_url}` 会被替换） |
+| `submit.body` | 请求体 JSON 字符串模板（见下方占位符） |
+| `poll_url_template` | 轮询地址模板（`{task_id}` 运行时替换） |
+| `content_items` | content 数组各角色的 item 模板：`text` / `first_frame` / `last_frame` / `reference_image` / `asset` |
+| `task_id_path` / `status_path` / `video_url_path` / `error_path` | 响应字段路径（点路径，`\|` 分隔多候选） |
+| `done_statuses` / `fail_statuses` | 状态词数组 |
+
+### 请求体占位符
+
+body 模板里用占位符拼 JSON，节点按类型替换：
+
+- **字符串**（写时加引号）：`{prompt}` `{model}` `{resolution}` `{ratio}`
+- **数字**（不加引号）：`{duration}` `{seed}`
+- **布尔**（不加引号）：`{generate_audio}` `{watermark}` `{return_last_frame}`
+- **content 数组**：`{content}`（由 `content_items` 按实际接的图 / 素材组装）
+
+### 示例：接入一个 OpenAI 兼容的视频接口
+
+```json
+{
+  "name": "openai_video",
+  "async": true,
+  "auth": {"headers": {"Authorization": "Bearer {api_key}", "Content-Type": "application/json"}},
+  "submit": {"method": "POST", "url": "{base_url}/v1/video/generations",
+             "body": "{\"model\": {model}, \"prompt\": {prompt}, \"seconds\": {duration}}"},
+  "poll_url_template": "{base_url}/v1/video/generations/{task_id}",
+  "content_items": {"text": "{\"type\": \"text\", \"text\": {prompt}}"},
+  "task_id_path": "id",
+  "status_path": "status",
+  "video_url_path": "video_url",
+  "done_statuses": ["completed"],
+  "fail_statuses": ["failed"]
+}
+```
+
+把这段 JSON 原样贴进节点 `recipe` 字段即可。内置 `ark_seedance` 配方即当前默认行为的等价声明。
+
+> 素材 / 真人认证那套（`CYAI 上传素材` 等）是火山方舟私有资产能力，不属于通用配方层，仍单独使用。
 
 ## 三种玩法
 
