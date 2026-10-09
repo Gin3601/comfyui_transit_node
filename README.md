@@ -22,8 +22,8 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 节点分类：
 
 - **`CYAI/Seedance`**：
-  - **CYAI Seedance 视频生成（中转站）** —— 生成视频，输出 VIDEO 对象
-  - **CYAI 图像合并 (+上传素材)** —— 把多张参考图归一成 IMAGE batch；勾选 `do_upload` 则**同时**上传成素材，输出 `asset_ids` 可直连视频节点
+  - **CYAI Seedance 视频生成（中转站）** —— 生成视频，输出 VIDEO 对象。**写实人物**打开 `upload_images` 即可自动转素材绕开真人检测
+  - **CYAI 图像合并** —— 把多张参考图归一成统一尺寸的 IMAGE batch（纯合并，不含上传）
 - **`CYAI/Asset`**（火山方舟素材资产接口）：
   - **CYAI 素材组** —— 创建 AIGC 虚拟人像组 / 查询素材组列表 / 查询详情
   - **CYAI 创建真人认证会话** —— 输出 H5Link（本人活体认证）+ BytedToken
@@ -98,8 +98,8 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 节点内部自动：把 `reference_images` / `first_frame` 收到的图 → 上传成素材 → 改用 `asset://` 引用。
 **不需要接 `asset_ids` 那根线。**
 
-> 与「图像合并的 `do_upload`」的区别：`do_upload` 是**在合并节点里**上传并把 ID 从 `asset_ids` 口吐出（需要你再接一根线到视频节点）；
-> 视频节点的 `upload_images` 是**在视频节点里**上传，**零接线**。二选一即可，别两头都开（会重复上传）。
+其它可调项（都有默认值，一般不用管）：`image_host`（图床）、`asset_group_id` / `asset_name`（素材组与名称，留空自动）、
+`upload_max_side` / `upload_quality`（上传图尺寸与质量）。
 
 ## 真人认证 / 素材流程
 

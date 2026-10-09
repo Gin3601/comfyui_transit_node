@@ -156,12 +156,11 @@ def _friendly_privacy_error(text: str) -> str | None:
             "输入图片被判定包含「真人」（真人脸隐私拦截，错误码 "
             "InputImageSensitiveContentDetected.PrivacyInformation）。\n"
             "base64 和公网 URL 两种传法都会被扫，**只有「素材引用」能绕开**。\n"
-            "【最快检查】如果你已经用了「CYAI 图像合并」并勾选了 do_upload：\n"
-            "  很可能线接错了 —— 正确接法是接它的 **asset_ids 输出（第 2 个输出点）**\n"
-            "  到本节点的 **asset_ids 输入口**；\n"
-            "  而不该把它的 **images 输出（第 1 个点）** 接到 first_frame / reference_images。\n"
+            "【最快检查】如果你在视频节点上开的 upload_images 没生效：\n"
+            "  确认 upload_images 已打开、api_key 已填，且图是接在\n"
+            "  reference_images / first_frame 上（接上后节点会自动转素材，无需再接 asset_ids）。\n"
             "【手动流程】若要自己建素材：\n"
-            "  1. 用「CYAI 上传素材」（或图像合并的 do_upload）把图变成素材，拿到 asset_id；\n"
+            "  1. 用「CYAI 上传素材」把图（或公网 URL）变成素材，拿到 asset_id；\n"
             "  2. 在本节点 asset_ids 里填该 ID（多个用逗号分隔）；\n"
             "  3. 清空 first_frame / last_frame / reference_images。\n"
             "【真人素材】真人面容需走活体认证：创建认证会话 → 本人认证 → 查询认证结果拿 GroupId →\n"
@@ -830,29 +829,7 @@ class CYAiSeedanceUsage:
         return (info,)
 
 
-# 上传相关的控件定义（图像合并 / 上传素材 共用）
-_UPLOAD_REQUIRED = {
-    "image_host": (
-        ["uguu", "catbox"],
-        {"default": "uguu", "tooltip": "上传用的免费匿名图床：uguu 稳定但链接数小时失效；catbox 永久但机房 IP 常被拒"},
-    ),
-    "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
-    "poll_interval": ("INT", {"default": 5, "min": 1, "max": 60, "step": 1, "tooltip": "轮询间隔（秒）"}),
-    "max_wait": ("INT", {"default": 300, "min": 30, "max": 1800, "step": 1, "tooltip": "最长等待（秒）"}),
-}
-_UPLOAD_OPTIONAL = {
-    "do_upload": ("BOOLEAN", {"default": False,
-                              "tooltip": "开启后：把图上传成素材并输出 asset_ids（绕开真人检测）；关闭则只合并输出 IMAGE"}),
-    "api_key": ("STRING", {"default": "", "tooltip": "开启上传时必填：中转站 API Key（sk-xxx）"}),
-    "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
-    "asset_name": ("STRING", {"default": "", "tooltip": "素材名称（开启上传时用；留空自动取名）"}),
-    "asset_type": (["Image", "Video", "Audio"], {"default": "Image", "tooltip": "素材类型"}),
-    "group_id": ("STRING", {"default": "", "tooltip": "素材组 ID；留空自动创建 AIGC 组"}),
-    "group_name": ("STRING", {"default": "", "tooltip": "自动创建素材组时的组名"}),
-    "upload_max_side": ("INT", {"default": 2048, "min": 300, "max": 6000, "step": 64, "tooltip": "上传图最长边"}),
-    "upload_quality": ("INT", {"default": 90, "min": 30, "max": 100, "step": 5, "tooltip": "上传图 JPEG 质量"}),
-}
-
+# 素材上传相关的内部工具（图像合并不再上传；上传由视频节点 upload_images 触发）
 
 def _ensure_group(base_url, api_key, group_id, group_name, fallback_name, project_name):
     """group_id 为空则自动创建 AIGC 组；返回 group_id。"""
@@ -903,7 +880,7 @@ def _upload_frames_to_assets(frames, base_url, api_key, name, image_host, asset_
     """
     api_key = (api_key or "").strip()
     if not api_key:
-        raise ValueError("开启上传（do_upload=true）时必须填写 api_key")
+        raise ValueError("开启素材上传（upload_images=true）时必须填写 api_key")
     name = (name or "").strip() or "asset"
     project_name = (project_name or "default").strip()
     group_id = _ensure_group(base_url, api_key, group_id, group_name, name, project_name)
@@ -928,14 +905,14 @@ def _upload_frames_to_assets(frames, base_url, api_key, name, image_host, asset_
 
 
 class CYAiImageBatch:
-    """图像合并 + 可选上传素材（一键二用）。
+    """图像合并节点：把多张图按顺序拼成一个 IMAGE batch。
 
-    默认只做原来的「把 image_1~image_9 合并成 IMAGE batch」；
-    勾选 `do_upload` 后，额外把合并后的图上传成素材，
-    并从 `asset_ids` 输出口给出可直连视频节点的素材 ID（绕开真人检测）。
+    提供 9 个可选输入口 image_1~image_9（Seedance 2.0 多图参考上限 9 张）；
+    每个口也能接本身带 batch 的图像（如 Load Image Sequence）。
 
-    这样只需要一个节点就能完成：
-      多图 → 合并 → 上传素材 → asset_ids → 视频生成
+    注意：本节点**不再负责上传素材**。要实现「写实人物绕开真人检测」，
+    请把输出接到「CYAI Seedance 视频生成」并打开它的 `upload_images` 开关
+    （视频节点会在内部把图上传成素材并以 asset:// 引用）。
     """
 
     @classmethod
@@ -951,36 +928,16 @@ class CYAiImageBatch:
             {"default": 1024, "min": 256, "max": 4096, "step": 64,
              "tooltip": "统一缩放边长（正方形、白底居中填充）。多图尺寸/比例不一致时，靠它把每张图归一成同尺寸再拼接"},
         )
-        optional["do_upload"] = _UPLOAD_OPTIONAL["do_upload"]
-        optional["api_key"] = _UPLOAD_OPTIONAL["api_key"]
-        optional["base_url"] = _UPLOAD_OPTIONAL["base_url"]
-        optional["asset_name"] = _UPLOAD_OPTIONAL["asset_name"]
-        optional["asset_type"] = _UPLOAD_OPTIONAL["asset_type"]
-        optional["group_id"] = _UPLOAD_OPTIONAL["group_id"]
-        optional["group_name"] = _UPLOAD_OPTIONAL["group_name"]
-        optional["upload_max_side"] = _UPLOAD_OPTIONAL["upload_max_side"]
-        optional["upload_quality"] = _UPLOAD_OPTIONAL["upload_quality"]
-        optional["image_host"] = _UPLOAD_REQUIRED["image_host"]
-        optional["project_name"] = _UPLOAD_REQUIRED["project_name"]
-        optional["poll_interval"] = _UPLOAD_REQUIRED["poll_interval"]
-        optional["max_wait"] = _UPLOAD_REQUIRED["max_wait"]
         return {"optional": optional}
 
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("images", "asset_ids", "group_id")
-    OUTPUT_TOOLTIPS = (
-        "合并后的图像 batch（按 image_1 → image_9 顺序）",
-        "素材 ID（逗号分隔；仅 do_upload=true 时非空，可直连视频节点 asset_ids）",
-        "素材组 ID（仅 do_upload=true 时非空）",
-    )
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    OUTPUT_TOOLTIPS = ("合并后的图像 batch（按 image_1 → image_9 顺序）",)
     FUNCTION = "merge"
     CATEGORY = "CYAI/Seedance"
-    DESCRIPTION = "合并最多 9 张图为 IMAGE batch；勾选 do_upload 则同时上传成素材并输出 asset_ids"
+    DESCRIPTION = "把最多 9 张图合并成一个 IMAGE batch，用于接 Seedance 的 reference_images 多图参考输入"
 
-    def merge(self, max_side=1024, do_upload=False, api_key="", base_url="https://www.cyai.club",
-              asset_name="", asset_type="Image", group_id="", group_name="",
-              upload_max_side=2048, upload_quality=90, image_host="uguu",
-              project_name="default", poll_interval=5, max_wait=300, **kwargs):
+    def merge(self, max_side=1024, **kwargs):
         frames = []
         for i in range(1, 10):
             img = kwargs.get(f"image_{i}")
@@ -997,17 +954,7 @@ class CYAiImageBatch:
         # max_side 正方形（长边缩放 + 白底居中填充），既保证拼接成功，
         # 又避免异形比例/透明图在 JPEG 里产生黑边污染参考图。
         normalized = [_uniform_square(f, int(max_side)) for f in frames]
-        images = torch.cat(normalized, dim=0)
-
-        if not do_upload:
-            return (images, "", "")
-
-        # 上传用**归一前的原图**（保留原始构图，不引入白边填充）
-        asset_ids, gid = _upload_frames_to_assets(
-            frames, base_url, api_key, asset_name, image_host, asset_type,
-            project_name, group_id, group_name, upload_max_side, upload_quality,
-            poll_interval, max_wait)
-        return (images, asset_ids, gid)
+        return (torch.cat(normalized, dim=0),)
 
 
 class CYAiCreateVerifySession:
