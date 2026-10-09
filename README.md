@@ -24,6 +24,8 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 - **`CYAI/Seedance`**：
   - **CYAI Seedance 视频生成（中转站）** —— 生成视频，输出 VIDEO 对象。**写实人物**打开 `upload_images` 即可自动转素材绕开真人检测
   - **CYAI 图像合并** —— 把多张参考图归一成统一尺寸的 IMAGE batch（纯合并，不含上传）
+- **`CYAI/Image`**：
+  - **CYAI 图像生成（中转站）** —— 生成图像，输出 IMAGE 对象（recipe 驱动，默认火山方舟 doubao-seedream 同步接口）。输出可直接接视频节点的 `first_frame` / `reference_images`，做「文生图 → 图生视频」
 - **`CYAI/Asset`**（火山方舟素材资产接口）：
   - **CYAI 素材组** —— 创建 AIGC 虚拟人像组 / 查询素材组列表 / 查询详情
   - **CYAI 创建真人认证会话** —— 输出 H5Link（本人活体认证）+ BytedToken
@@ -122,6 +124,24 @@ body 模板里用占位符拼 JSON，节点按类型替换：
 ```
 
 把这段 JSON 原样贴进节点 `recipe` 字段即可。内置 `ark_seedance` 配方即当前默认行为的等价声明。
+
+### 图像生成配方
+
+**CYAI 图像生成** 节点复用同一套配方机制，但默认走**同步接口**（提交即返回图片），内置配方 `ark_seedream`（火山方舟 doubao-seedream）。图像配方与视频配方的差异字段：
+
+| 键 | 说明 |
+|---|---|
+| `async` | 默认 `false`（同步）。少数图像接口是任务制，设 `true` 并提供 `poll_url_template` / `task_id_path` / `status_path` |
+| `result_path` | 图片所在数组的字段路径，默认 `data`（`data[].url` 或 `data[].b64_json`） |
+| `image_field` | 图生图参考字段名，默认 `image`（换接口时改成对方字段名，如 `init_image`） |
+
+图像节点请求体占位符：`{prompt}` `{model}` `{size}` `{seed}` `{watermark}` `{response_format}` `{n}`。图生图时节点会自动按 `image_field` 注入参考图（单图 = 字符串，多图 = 数组）。
+
+图像节点输出 `IMAGE`，可直接接视频节点的 `first_frame` / `reference_images`，无需转换：
+
+```
+[CYAI 图像生成] ──IMAGE──→ [CYAI Seedance 视频生成].first_frame → 图生视频
+```
 
 > 素材 / 真人认证那套（`CYAI 上传素材` 等）是火山方舟私有资产能力，不属于通用配方层，仍单独使用。
 

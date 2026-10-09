@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from .nodes import (
     CYAiSeedanceVideo,
+    CYAiImageGen,
     CYAiImageBatch,
     CYAiAssetGroup,
     CYAiCreateVerifySession,
@@ -11,6 +12,7 @@ from .nodes import (
 
 NODE_CLASS_MAPPINGS = {
     "CYAI_Seedance_Video": CYAiSeedanceVideo,
+    "CYAI_ImageGen": CYAiImageGen,
     # "CYAI_Seedance_Usage": CYAiSeedanceUsage,
     "CYAI_ImageBatch": CYAiImageBatch,
     "CYAI_AssetGroup": CYAiAssetGroup,
@@ -21,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CYAI_Seedance_Video": "CYAI Seedance 视频生成 (cyai.club)",
+    "CYAI_ImageGen": "CYAI 图像生成 (中转站)",
     # "CYAI_Seedance_Usage": "CYAI Seedance 消耗查询 (cyai.club)",
     "CYAI_ImageBatch": "CYAI 图像合并 (多图参考)",
     "CYAI_AssetGroup": "CYAI 素材组 (创建/查询)",

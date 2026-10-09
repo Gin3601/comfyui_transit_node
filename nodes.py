@@ -212,6 +212,13 @@ def _video_from_bytes(video_bytes: bytes):
     return InputImpl.VideoFromFile(io.BytesIO(video_bytes))
 
 
+def _image_from_bytes(img_bytes: bytes) -> torch.Tensor:
+    """把图片字节（JPEG/PNG 等）解码成 ComfyUI IMAGE 张量 [1,H,W,C] (0-1 float)。"""
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    arr = np.array(pil).astype(np.float32) / 255.0
+    return torch.from_numpy(arr)[None, ...]
+
+
 def _jpeg_bytes_from_image(image: torch.Tensor, max_side: int = 2048,
                            quality: int = 90, min_side: int = 300) -> bytes:
     """把 IMAGE 张量转成 JPEG 字节。用于上传公网图床。
@@ -418,6 +425,31 @@ ARK_SEEDANCE_RECIPE = {
 }
 
 
+# 火山方舟 doubao-seedream 图像生成（同步返回 data[].url / b64_json）
+ARK_SEEDREAM_RECIPE = {
+    "name": "ark_seedream",
+    "display_name": "火山方舟 doubao-seedream（图像生成，同步）",
+    "async": False,
+    "auth": {
+        "headers": {
+            "Authorization": "Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    },
+    "submit": {
+        "method": "POST",
+        "url": "{base_url}/api/v3/images/generations",
+        "body": (
+            '{"model": {model}, "prompt": {prompt}, "size": {size}, '
+            '"seed": {seed}, "watermark": {watermark}, "response_format": {response_format}}'
+        ),
+    },
+    "image_field": "image",
+    "result_path": "data",
+    "error_path": "error.message|error.code",
+}
+
+
 def _json_str(value) -> str:
     """把值序列化成 JSON 字符串字面量（带引号 + 转义），用于注入模板。"""
     return json.dumps(str(value), ensure_ascii=False)
@@ -446,6 +478,8 @@ def _load_recipe(recipe):
         return None
     if recipe == "ark_seedance":
         return dict(ARK_SEEDANCE_RECIPE)
+    if recipe == "ark_seedream":
+        return dict(ARK_SEEDREAM_RECIPE)
     if os.path.isfile(recipe):
         with open(recipe, encoding="utf-8") as f:
             return json.load(f)
@@ -917,6 +951,181 @@ class CYAiSeedanceVideo:
             last_state = _http_json("GET", poll_url, headers, timeout=60.0)
 
         raise RuntimeError("轮询超时（%s 秒），最后状态：%s" % (int(max_wait), last_state))
+
+
+class CYAiImageGen:
+    """通用图像生成节点（recipe 驱动），默认火山方舟 doubao-seedream（同步接口）。
+
+    复用视频节点同一套 recipe 基础设施（_load_recipe / _render_template / _http_json /
+    _resolve_url / _resolve_field / _download），差异只在：输出 IMAGE、请求体字段
+    （size/seed/watermark/response_format）、响应结构（data[].url 或 b64_json）。
+    输出 IMAGE 可直接接视频节点的 first_frame / reference_images，做「文生图 → 图生视频」。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": (
+                    "STRING",
+                    {"default": "", "tooltip": "中转站 API Key（sk-xxx）"},
+                ),
+                "base_url": (
+                    "STRING",
+                    {"default": "https://www.cyai.club", "tooltip": "中转站地址"},
+                ),
+                "model": (
+                    "STRING",
+                    {"default": "doubao-seedream-4-0-250828",
+                     "tooltip": "图像生成模型名（可自由输入；常见 doubao-seedream-4-0 / 4-5 / 5-0 系列）"},
+                ),
+                "prompt": (
+                    "STRING",
+                    {"multiline": True, "default": "", "tooltip": "图像描述提示词"},
+                ),
+                "size": (
+                    "STRING",
+                    {"default": "2K", "tooltip": "输出尺寸：1K/2K/3K/4K 档位，或像素尺寸如 2048x2048"},
+                ),
+            },
+            "optional": {
+                "image": (
+                    "IMAGE",
+                    {"tooltip": "可选：图生图参考图（多张 = 多图融合）"},
+                ),
+                "seed": (
+                    "INT",
+                    {"default": -1, "min": -1, "max": 2147483647, "step": 1,
+                     "tooltip": "随机种子（-1 表示随机）"},
+                ),
+                "watermark": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "是否添加 AI 水印"},
+                ),
+                "recipe": (
+                    "STRING",
+                    {"default": "",
+                     "tooltip": "协议配方：内置名 ark_seedream（火山方舟 doubao-seedream），或贴 recipe JSON / 填文件路径接入其它图像 API。留空 = 默认 ark_seedream"},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    OUTPUT_TOOLTIPS = ("生成的图像（ComfyUI IMAGE 张量，可接预览/保存，或视频节点的参考图）",)
+    FUNCTION = "generate"
+    CATEGORY = "CYAI/Image"
+    DESCRIPTION = "通用图像生成（recipe 驱动），默认火山方舟 doubao-seedream，输出 IMAGE"
+
+    def generate(self, api_key, base_url, model, prompt, size,
+                 image=None, seed=-1, watermark=False, recipe=""):
+        api_key = (api_key or "").strip()
+        prompt = (prompt or "").strip()
+        if not api_key:
+            raise ValueError("api_key 不能为空，请填写中转站的 sk-xxx")
+        if not prompt:
+            raise ValueError("prompt 不能为空")
+
+        base = (base_url or "").strip().rstrip("/")
+        if not base:
+            base = "https://www.cyai.club"
+
+        r = _load_recipe(recipe) or dict(ARK_SEEDREAM_RECIPE)
+
+        # 鉴权头
+        auth_cfg = r.get("auth") or {}
+        headers = {k: _render_template(v, {"api_key": api_key})
+                   for k, v in (auth_cfg.get("headers") or {}).items()}
+
+        # 提交地址 + 请求体模板
+        submit = r.get("submit") or {}
+        method = submit.get("method", "POST")
+        url = _resolve_url(base, _render_template(submit.get("url") or "", {"base_url": base}))
+        body_template = submit.get("body") or "{}"
+
+        # 通用标量占位符
+        body_values = {
+            "prompt": _json_str(prompt),
+            "model": _json_str(model),
+            "size": _json_str(size),
+            "seed": str(int(seed)),
+            "watermark": "true" if watermark else "false",
+            "response_format": _json_str("url"),
+            "n": "1",
+        }
+
+        # 图生图：image 字段（字段名 recipe 可配，默认 image），单图=字符串、多图=数组
+        image_field = r.get("image_field") or "image"
+        image_val = None
+        if image is not None:
+            imgs = image if image.dim() == 4 else image.unsqueeze(0)
+            uris = [_image_to_data_uri(imgs[i]) for i in range(imgs.shape[0])]
+            image_val = uris[0] if len(uris) == 1 else uris
+
+        body_str = _render_template(body_template, body_values)
+        try:
+            body = json.loads(body_str)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                "请求体模板渲染后不是有效 JSON：%s；渲染结果：%s" % (e, body_str[:1500])) from e
+        if image_val is not None:
+            body[image_field] = image_val
+
+        resp = _http_json(method, url, headers, body, timeout=180.0)
+
+        # 异步接口（少数图像 API 是任务制）：轮询到完成再取结果
+        if r.get("async"):
+            task_id = _resolve_first(resp, r.get("task_id_path") or "id|data.id")
+            if not task_id:
+                raise RuntimeError("提交响应里找不到任务 ID：%s" % resp)
+            poll_tpl = r.get("poll_url_template") or ""
+            poll_url = _resolve_url(base, _render_template(poll_tpl, {"base_url": base}))
+            poll_url = poll_url.replace("{task_id}", str(task_id))
+            status_path = r.get("status_path") or "status"
+            done_set = _status_set(r.get("done_statuses") or ["succeeded", "success", "done"])
+            fail_set = _status_set(r.get("fail_statuses") or ["failed", "error"])
+            error_path = r.get("error_path") or "error.message|error.code"
+            deadline = time.time() + 900.0
+            while time.time() < deadline:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                state = _http_json("GET", poll_url, headers, timeout=60.0)
+                st = str(_resolve_first(state, status_path) or "").lower()
+                if st in fail_set:
+                    raise RuntimeError("图像生成任务失败：%s"
+                                       % (_resolve_first(state, error_path) or state))
+                if st in done_set:
+                    resp = state
+                    break
+                time.sleep(5.0)
+            else:
+                raise RuntimeError("图像生成轮询超时")
+
+        # 解析图片：result_path 指向 data 数组（每项 url 或 b64_json）
+        result_path = r.get("result_path") or "data"
+        items = _resolve_field(resp, result_path)
+        if not isinstance(items, list):
+            if isinstance(items, dict):
+                items = [items]
+            elif isinstance(items, str) and items:
+                items = [{"url": items}]
+            else:
+                raise RuntimeError("响应里找不到图像（路径 %s）：%s" % (result_path, resp))
+
+        frames = []
+        for it in items:
+            if not isinstance(it, dict):
+                raise RuntimeError("图像项结构异常：%s" % it)
+            b64 = it.get("b64_json")
+            if b64:
+                frames.append(_image_from_bytes(base64.b64decode(b64)))
+            elif it.get("url"):
+                frames.append(_image_from_bytes(_download(it["url"], headers)))
+            else:
+                raise RuntimeError("图像项既无 url 也无 b64_json：%s" % it)
+        if not frames:
+            raise RuntimeError("未解析出任何图像")
+
+        return (torch.cat(frames, dim=0),)
 
 
 class CYAiSeedanceUsage:
