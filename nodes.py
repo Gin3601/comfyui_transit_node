@@ -464,10 +464,6 @@ class CYAiSeedanceVideo:
                     "IMAGE",
                     {"tooltip": "可选：多张参考图（role=reference_image，建议 1-4 张），与首尾帧互斥"},
                 ),
-                "asset_ids": (
-                    "STRING",
-                    {"default": "", "tooltip": "可选：真人/AIGC 素材 ID（逗号分隔），按 asset://<id> 引用，用于已认证的真人素材；与首尾帧互斥"},
-                ),
                 "poll_interval": (
                     "INT",
                     {"default": 10, "min": 1, "max": 60, "step": 1,
@@ -512,6 +508,12 @@ class CYAiSeedanceVideo:
                     "STRING",
                     {"default": "failed,error,cancelled,canceled",
                      "tooltip": "逗号分隔的失败状态词（不区分大小写）"},
+                ),
+                # 新增控件一律追加在最后：ComfyUI 按「位置」给控件赋值，
+                # 插在中间会让旧工作流整体错位一格（曾把 image_max_side 冲成 80）。
+                "asset_ids": (
+                    "STRING",
+                    {"default": "", "tooltip": "可选：素材 ID（逗号分隔），按 asset://<id> 引用。接「图像合并」的 asset_ids 输出；与首尾帧互斥"},
                 ),
             },
         }
