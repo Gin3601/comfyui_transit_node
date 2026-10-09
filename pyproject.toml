@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-cyai-seedance"
+description = "在 ComfyUI 中调用 CYAI 中转站 (cyai.club) 的 doubao-seedance 视频生成模型（火山方舟 Ark 原生接口），含文生视频/首尾帧/多图参考，输出 VIDEO 对象"
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+# 本节点仅使用 ComfyUI 自带依赖（torch/numpy/PIL/comfy_api/标准库），无需额外安装包
+
+[project.urls]
+Repository = "https://github.com/Gin3601/comfyui-cyai-seedance"
+
+[tool.comfy]
+# PublisherId：在 https://registry.comfy.org 创建 publisher 后，把其 ID 填到这里（全局唯一，不可改）
+PublisherId = ""
+DisplayName = "CYAI Seedance 视频生成 (cyai.club)"
+Icon = ""

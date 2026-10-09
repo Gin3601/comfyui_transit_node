@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 本地工作流示例（含个人 api_key，勿提交；如确认已清空可删掉此行）
+视频生成.json
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
