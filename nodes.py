@@ -766,12 +766,112 @@ class CYAiSeedanceUsage:
         return (info,)
 
 
-class CYAiImageBatch:
-    """图像合并节点：把多张图按顺序拼成一个 IMAGE batch，用于接到多图参考输入。
+# 上传相关的控件定义（图像合并 / 上传素材 共用）
+_UPLOAD_REQUIRED = {
+    "image_host": (
+        ["uguu", "catbox"],
+        {"default": "uguu", "tooltip": "上传用的免费匿名图床：uguu 稳定但链接数小时失效；catbox 永久但机房 IP 常被拒"},
+    ),
+    "project_name": ("STRING", {"default": "default", "tooltip": "项目名，默认 default"}),
+    "poll_interval": ("INT", {"default": 5, "min": 1, "max": 60, "step": 1, "tooltip": "轮询间隔（秒）"}),
+    "max_wait": ("INT", {"default": 300, "min": 30, "max": 1800, "step": 1, "tooltip": "最长等待（秒）"}),
+}
+_UPLOAD_OPTIONAL = {
+    "do_upload": ("BOOLEAN", {"default": False,
+                              "tooltip": "开启后：把图上传成素材并输出 asset_ids（绕开真人检测）；关闭则只合并输出 IMAGE"}),
+    "api_key": ("STRING", {"default": "", "tooltip": "开启上传时必填：中转站 API Key（sk-xxx）"}),
+    "base_url": ("STRING", {"default": "https://www.cyai.club", "tooltip": "中转站地址"}),
+    "asset_name": ("STRING", {"default": "", "tooltip": "素材名称（开启上传时用；留空自动取名）"}),
+    "asset_type": (["Image", "Video", "Audio"], {"default": "Image", "tooltip": "素材类型"}),
+    "group_id": ("STRING", {"default": "", "tooltip": "素材组 ID；留空自动创建 AIGC 组"}),
+    "group_name": ("STRING", {"default": "", "tooltip": "自动创建素材组时的组名"}),
+    "upload_max_side": ("INT", {"default": 2048, "min": 300, "max": 6000, "step": 64, "tooltip": "上传图最长边"}),
+    "upload_quality": ("INT", {"default": 90, "min": 30, "max": 100, "step": 5, "tooltip": "上传图 JPEG 质量"}),
+}
 
-    提供 9 个可选输入口 image_1~image_9（Seedance 2.0 多图参考上限 9 张）；
-    每个口也能接本身带 batch 的图像（如 Load Image Sequence），总数上限由
-    模型（2.0=9 张 / 2.5=30 张）和 64MB 请求体共同决定。
+
+def _ensure_group(base_url, api_key, group_id, group_name, fallback_name, project_name):
+    """group_id 为空则自动创建 AIGC 组；返回 group_id。"""
+    group_id = (group_id or "").strip()
+    if group_id:
+        return group_id
+    payload = {
+        "Name": (group_name or "").strip() or ("auto-" + (fallback_name or "asset"))[:64],
+        "ProjectName": (project_name or "default").strip(),
+        "GroupType": "AIGC",
+    }
+    result = _ark_action(base_url, api_key, "CreateAssetGroup", payload, timeout=60.0)
+    gid = result.get("Id") or ""
+    if not gid:
+        raise RuntimeError("自动创建素材组失败，响应里没有 Id：%s" % result)
+    return gid
+
+
+def _wait_assets_active(base_url, api_key, asset_ids, project_name, poll_interval, max_wait):
+    """轮询 GetAsset 直到全部 Active；任一 Failed 或超时报错。"""
+    pending = set(asset_ids)
+    deadline = time.time() + float(max_wait)
+    detail = None
+    while pending and time.time() < deadline:
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        for aid in list(pending):
+            detail = _ark_action(base_url, api_key, "GetAsset",
+                                 {"Id": aid, "ProjectName": project_name}, timeout=60.0)
+            status = str(detail.get("Status") or "").lower()
+            if status == "active":
+                pending.discard(aid)
+            elif status == "failed":
+                err = detail.get("Error") or {}
+                raise RuntimeError("素材处理失败（%s）：%s %s" % (
+                    aid, err.get("Code") or "", err.get("Message") or ""))
+        if pending:
+            time.sleep(float(poll_interval))
+    if pending:
+        raise RuntimeError("素材处理超时（%s 秒），未就绪：%s" % (int(max_wait), sorted(pending)))
+
+
+def _upload_frames_to_assets(frames, base_url, api_key, name, image_host, asset_type,
+                             project_name, group_id, group_name, upload_max_side,
+                             upload_quality, poll_interval, max_wait):
+    """把一批 IMAGE 帧逐张上传图床 → 建素材 → 轮询到 Active。
+
+    返回 (asset_ids_逗号串, group_id)。
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise ValueError("开启上传（do_upload=true）时必须填写 api_key")
+    name = (name or "").strip() or "asset"
+    project_name = (project_name or "default").strip()
+    group_id = _ensure_group(base_url, api_key, group_id, group_name, name, project_name)
+
+    asset_ids = []
+    for i, frame in enumerate(frames):
+        img_bytes = _jpeg_bytes_from_image(
+            frame, max_side=int(upload_max_side), quality=int(upload_quality))
+        url = _upload_to_host(img_bytes, "cyai_%d_%d.jpg" % (int(time.time()), i),
+                              provider=image_host)
+        asset_name = name if len(frames) == 1 else "%s-%d" % (name, i + 1)
+        result = _ark_action(base_url, api_key, "CreateAsset", {
+            "GroupId": group_id, "Name": asset_name, "URL": url,
+            "AssetType": asset_type, "ProjectName": project_name}, timeout=120.0)
+        aid = result.get("Id") or ""
+        if not aid:
+            raise RuntimeError("创建素材失败，响应里没有 Id：%s" % result)
+        asset_ids.append(aid)
+
+    _wait_assets_active(base_url, api_key, asset_ids, project_name, poll_interval, max_wait)
+    return (",".join(asset_ids), group_id)
+
+
+class CYAiImageBatch:
+    """图像合并 + 可选上传素材（一键二用）。
+
+    默认只做原来的「把 image_1~image_9 合并成 IMAGE batch」；
+    勾选 `do_upload` 后，额外把合并后的图上传成素材，
+    并从 `asset_ids` 输出口给出可直连视频节点的素材 ID（绕开真人检测）。
+
+    这样只需要一个节点就能完成：
+      多图 → 合并 → 上传素材 → asset_ids → 视频生成
     """
 
     @classmethod
@@ -787,16 +887,36 @@ class CYAiImageBatch:
             {"default": 1024, "min": 256, "max": 4096, "step": 64,
              "tooltip": "统一缩放边长（正方形、白底居中填充）。多图尺寸/比例不一致时，靠它把每张图归一成同尺寸再拼接"},
         )
+        optional["do_upload"] = _UPLOAD_OPTIONAL["do_upload"]
+        optional["api_key"] = _UPLOAD_OPTIONAL["api_key"]
+        optional["base_url"] = _UPLOAD_OPTIONAL["base_url"]
+        optional["asset_name"] = _UPLOAD_OPTIONAL["asset_name"]
+        optional["asset_type"] = _UPLOAD_OPTIONAL["asset_type"]
+        optional["group_id"] = _UPLOAD_OPTIONAL["group_id"]
+        optional["group_name"] = _UPLOAD_OPTIONAL["group_name"]
+        optional["upload_max_side"] = _UPLOAD_OPTIONAL["upload_max_side"]
+        optional["upload_quality"] = _UPLOAD_OPTIONAL["upload_quality"]
+        optional["image_host"] = _UPLOAD_REQUIRED["image_host"]
+        optional["project_name"] = _UPLOAD_REQUIRED["project_name"]
+        optional["poll_interval"] = _UPLOAD_REQUIRED["poll_interval"]
+        optional["max_wait"] = _UPLOAD_REQUIRED["max_wait"]
         return {"optional": optional}
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
-    OUTPUT_TOOLTIPS = ("合并后的图像 batch（按 image_1 → image_9 顺序）",)
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "asset_ids", "group_id")
+    OUTPUT_TOOLTIPS = (
+        "合并后的图像 batch（按 image_1 → image_9 顺序）",
+        "素材 ID（逗号分隔；仅 do_upload=true 时非空，可直连视频节点 asset_ids）",
+        "素材组 ID（仅 do_upload=true 时非空）",
+    )
     FUNCTION = "merge"
     CATEGORY = "CYAI/Seedance"
-    DESCRIPTION = "把最多 9 张图合并成一个 IMAGE batch，用于接 Seedance 的 reference_images 多图参考输入"
+    DESCRIPTION = "合并最多 9 张图为 IMAGE batch；勾选 do_upload 则同时上传成素材并输出 asset_ids"
 
-    def merge(self, max_side=1024, **kwargs):
+    def merge(self, max_side=1024, do_upload=False, api_key="", base_url="https://www.cyai.club",
+              asset_name="", asset_type="Image", group_id="", group_name="",
+              upload_max_side=2048, upload_quality=90, image_host="uguu",
+              project_name="default", poll_interval=5, max_wait=300, **kwargs):
         frames = []
         for i in range(1, 10):
             img = kwargs.get(f"image_{i}")
@@ -813,7 +933,17 @@ class CYAiImageBatch:
         # max_side 正方形（长边缩放 + 白底居中填充），既保证拼接成功，
         # 又避免异形比例/透明图在 JPEG 里产生黑边污染参考图。
         normalized = [_uniform_square(f, int(max_side)) for f in frames]
-        return (torch.cat(normalized, dim=0),)
+        images = torch.cat(normalized, dim=0)
+
+        if not do_upload:
+            return (images, "", "")
+
+        # 上传用**归一前的原图**（保留原始构图，不引入白边填充）
+        asset_ids, gid = _upload_frames_to_assets(
+            frames, base_url, api_key, asset_name, image_host, asset_type,
+            project_name, group_id, group_name, upload_max_side, upload_quality,
+            poll_interval, max_wait)
+        return (images, asset_ids, gid)
 
 
 class CYAiCreateVerifySession:
@@ -1048,70 +1178,25 @@ class CYAiCreateAsset:
             raise ValueError("api_key 不能为空")
         if not name:
             raise ValueError("name 不能为空，请填写素材名称")
-
-        # group_id 留空 -> 自动创建 AIGC 素材组
-        if not group_id:
-            group_payload = {
-                "Name": (group_name or "").strip() or ("auto-" + name)[:64],
-                "ProjectName": project_name,
-                "GroupType": "AIGC",
-            }
-            group_result = _ark_action(base_url, api_key, "CreateAssetGroup", group_payload, timeout=60.0)
-            group_id = group_result.get("Id") or ""
-            if not group_id:
-                raise RuntimeError("自动创建素材组失败，响应里没有 Id：%s" % group_result)
-
-        # 收集待上传来源：优先 url；否则把本地图的每一帧都上传（支持 batch 多张）
-        urls = []
-        if url:
-            urls.append(url)
-        elif image is not None:
-            frames = image if image.dim() == 4 else image.unsqueeze(0)
-            total = frames.shape[0]
-            for i in range(total):
-                img_bytes = _jpeg_bytes_from_image(
-                    frames[i], max_side=int(upload_max_side), quality=int(upload_quality))
-                urls.append(_upload_to_host(
-                    img_bytes, "cyai_%d_%d.jpg" % (int(time.time()), i), provider=image_host))
-        else:
+        if not url and image is None:
             raise ValueError("请连接 image 输入（本地图）或在 url 填公网地址，二者必填其一")
 
-        # 每个 URL 建一个素材，轮询到 Active；输出逗号分隔的 asset_id 串
-        asset_ids = []
-        for idx, u in enumerate(urls):
-            asset_name = name if len(urls) == 1 else "%s-%d" % (name, idx + 1)
+        # 给公网 URL 时无需建组前置（_ensure_group 会处理），直接建素材
+        if url:
+            group_id = _ensure_group(base_url, api_key, group_id, group_name, name, project_name)
             result = _ark_action(base_url, api_key, "CreateAsset", {
-                "GroupId": group_id,
-                "Name": asset_name,
-                "URL": u,
-                "AssetType": asset_type,
-                "ProjectName": project_name,
-            }, timeout=120.0)
+                "GroupId": group_id, "Name": name, "URL": url,
+                "AssetType": asset_type, "ProjectName": project_name}, timeout=120.0)
             asset_id = result.get("Id") or ""
             if not asset_id:
                 raise RuntimeError("创建素材失败，响应里没有 Id：%s" % result)
-            asset_ids.append(asset_id)
+            _wait_assets_active(base_url, api_key, [asset_id], project_name,
+                                poll_interval, max_wait)
+            return (asset_id, group_id)
 
-        # 轮询 GetAsset 直到全部 Active / 任一 Failed
-        pending = set(asset_ids)
-        deadline = time.time() + float(max_wait)
-        detail = None
-        while pending and time.time() < deadline:
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            for aid in list(pending):
-                detail = _ark_action(base_url, api_key, "GetAsset", {
-                    "Id": aid, "ProjectName": project_name}, timeout=60.0)
-                status = str(detail.get("Status") or "").lower()
-                if status == "active":
-                    pending.discard(aid)
-                elif status == "failed":
-                    err = detail.get("Error") or {}
-                    raise RuntimeError(
-                        "素材处理失败（%s）：%s %s" % (aid, err.get("Code") or "",
-                                                err.get("Message") or ""))
-            if pending:
-                time.sleep(float(poll_interval))
-        if pending:
-            raise RuntimeError("素材处理超时（%s 秒），未就绪：%s" % (int(max_wait), sorted(pending)))
-
-        return (",".join(asset_ids), group_id)
+        # 本地图：按 batch 展开，逐张上传建素材
+        frames = list(image if image.dim() == 4 else image.unsqueeze(0))
+        return _upload_frames_to_assets(
+            frames, base_url, api_key, name, image_host, asset_type,
+            project_name, group_id, group_name, upload_max_side, upload_quality,
+            poll_interval, max_wait)

@@ -23,12 +23,12 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 
 - **`CYAI/Seedance`**：
   - **CYAI Seedance 视频生成（中转站）** —— 生成视频，输出 VIDEO 对象
-  - **CYAI 图像合并 (多图参考)** —— 把多张参考图归一成统一尺寸的 IMAGE batch
-- **`CYAI/Asset`**（火山方舟素材资产接口，解决真人脸隐私拦截）：
+  - **CYAI 图像合并 (+上传素材)** —— 把多张参考图归一成 IMAGE batch；勾选 `do_upload` 则**同时**上传成素材，输出 `asset_ids` 可直连视频节点
+- **`CYAI/Asset`**（火山方舟素材资产接口）：
   - **CYAI 素材组** —— 创建 AIGC 虚拟人像组 / 查询素材组列表 / 查询详情
   - **CYAI 创建真人认证会话** —— 输出 H5Link（本人活体认证）+ BytedToken
   - **CYAI 查询认证结果** —— 轮询拿到真人素材组 GroupId
-  - **CYAI 上传素材** —— **接本地图**（自动传免费图床拿 URL）或直接填 URL → 创建素材 → 轮询到 Active；`group_id` 留空时自动创建 AIGC 素材组
+  - **CYAI 上传素材** —— 单独上传（接本地图或 URL），输出 `asset_ids`；需要单独用时才接它
 
 ## 输出
 
@@ -78,24 +78,26 @@ git clone https://github.com/Gin3601/comfyui_transit_node.git
 | 文生视频 | 三个图口都不接 | 纯文字生成 |
 | 图生视频 / 首尾帧 | 接 `first_frame`（+ 可选 `last_frame`） | **ratio 必须设 adaptive** |
 | 多图参考 | 接 `reference_images`（多张） | 融合多图生成 |
-| **本地图（含真人脸）** | 接 **CYAI 上传素材** 的 `image` → 拿 `asset_id` → 视频节点 `asset_ids` | 绕开 base64 真人检测，全自动 |
+| **漫剧/真人感人物** | `图像合并`(勾选 `do_upload`) → `asset_ids` → 视频节点 `asset_ids` | 一个节点搞定合并+素材，绕开真人检测 |
 
-## 本地图跑真人素材（全自动，推荐）
+## 写实人物（AI 漫剧）推荐接法
 
-以前必须先把图传到图床拿公网链接，现在节点会自动做：
+写实人脸会被上游真人检测拦（base64 ❌、公网 URL ❌，只有素材库 ✅），所以：
 
 ```
-[加载图像] → [CYAI 图像合并] ── image ──→ [CYAI 上传素材] ── asset_id ──→ [CYAI Seedance 视频生成].asset_ids
-                                              ↑ 自动上传免费图床(uguu)拿 URL
-                                              ↑ group_id 留空 → 自动建 AIGC 组
+[加载图像] ─┐
+            ├→ [CYAI 图像合并]  ← 勾选 do_upload，填 api_key
+[加载图像] ─┘        │
+                     ├─ asset_ids (STRING) ──→ [CYAI Seedance 视频生成].asset_ids
+                     └─ images    (IMAGE) ──→ （不需要，留空）
 ```
 
-- **CYAI 上传素材** 的 `image` 口接本地图即可，节点内部：本地图 → JPEG → uguu 图床 → 公网 URL → CreateAsset → 轮询到 Active。
-- 不接 `image`、改在 `url` 填公网地址也行（有现成链接时）。
-- 注意素材接口限制：**宽 300–6000px**（节点会自动缩/放到合适尺寸）、单张 <10MB、仅公网 http(s)。
-- uguu 链接数小时失效，但素材接口会**立即下载并转存**到平台托管存储，所以不影响使用。
+- **一个节点搞定**：合并 + 上传素材，不必再接「CYAI 上传素材」。
+- `do_upload` 不勾时，行为与原来完全一致（只合并输出 IMAGE）。
+- 上传用的是**归一前的原图**（保留原始构图，不引入白边）。
+- 想单独上传单张/已有 URL 时，才用 `CYAI/Asset` 下的「CYAI 上传素材」。
 
-## 真人认证 / 素材流程（解决「真人脸隐私拦截」）
+## 真人认证 / 素材流程
 
 `doubao-seedance` 不允许把真人面容直接以 base64 传进视频任务，会报
 `InputImageSensitiveContentDetected.PrivacyInformation`（`may contain real person`）。
