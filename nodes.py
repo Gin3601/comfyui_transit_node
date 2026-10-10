@@ -193,8 +193,20 @@ def _http_json(method: str, url: str, headers: dict, payload: dict | None = None
 
 
 def _download(url: str, headers: dict, timeout: float = 300.0) -> bytes:
-    """下载视频字节。视频 URL 是 TOS 临时签名链接，一般无需鉴权头。"""
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    """下载视频/图片字节。视频 URL 是 TOS 临时签名链接，一般无需鉴权头。
+
+    图片 URL 可能是 Cloudflare/CDN 托管的，urllib 默认 UA（Python-urllib/x.y）
+    会被 Cloudflare 以 403 error code 1010「浏览器签名」拦截。这里补一个浏览器
+    User-Agent 兜底（不覆盖调用方显式传入的 UA），并剥离鉴权头——下载 CDN 资源
+    不该带中转站的 Authorization，避免跨域泄漏 key。
+    """
+    dl_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "authorization"}
+    if not any(k.lower() == "user-agent" for k in dl_headers):
+        dl_headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
+    req = urllib.request.Request(url, headers=dl_headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
