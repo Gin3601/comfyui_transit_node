@@ -1,7 +1,7 @@
 [project]
 name = "comfyui_transit_node"
 description = "在 ComfyUI 中调用 CYAI 中转站 (cyai.club) 的 doubao-seedance 视频生成模型（火山方舟 Ark 原生接口），含文生视频/首尾帧/多图参考，输出 VIDEO 对象"
-version = "1.1.1"
+version = "1.2.0"
 license = { file = "LICENSE" }
 dependencies = []
 # 本节点仅使用 ComfyUI 自带依赖（torch/numpy/PIL/comfy_api/标准库），无需额外安装包
