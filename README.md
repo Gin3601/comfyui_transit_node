@@ -137,6 +137,28 @@ body 模板里用占位符拼 JSON，节点按类型替换：
 
 图像节点请求体占位符：`{prompt}` `{model}` `{size}` `{seed}` `{watermark}` `{response_format}` `{n}`。图生图时节点会自动按 `image_field` 注入参考图（单图 = 字符串，多图 = 数组）。
 
+### 不预设供应商：字段 / 端口 / JSON 结构全部自由
+
+中转站之间端口、字段命名、JSON 结构都不一样，节点**不内置任何供应商字段集合**，只保留默认 seedream 行为作为开箱可用基线。要接任意中转站，用下面几个可选字段自由声明，无需写整份 recipe：
+
+| 字段 | 说明 |
+|---|---|
+| `submit_url` | 提交接口地址（相对 `base_url` 或完整 URL）。端口不同时直接改这里 |
+| `extra_body` | 额外请求体字段（JSON 对象），**合并进请求体并覆盖同名字段**。字段命名/结构与默认不同时，在这里自由声明任意字段，如 `{"width": 1024, "height": 1024, "cfg_scale": 7.5}` |
+| `response_format` | 返回格式：`url` / `b64_json`，按中转站支持情况选 |
+| `result_path` | 响应里图片数组的字段路径（点路径），如 `data` / `result.images` / `output`；也支持直接指向字符串 URL 或字符串数组 |
+| `url_field` | 图片项内 URL 的字段名，默认 `url`（改 `image_url` / `link` 等） |
+| `b64_field` | 图片项内 base64 的字段名，默认 `b64_json`（改 `base64` / `image_b64` 等） |
+
+示例：接一个字段完全不同的中转站（端口 `/v1/txt2img`、请求体用 `width`/`height`、响应是 `result.images[].image_url`）：
+
+```
+submit_url = /v1/txt2img
+extra_body = {"width": 1024, "height": 1024, "cfg_scale": 7.5}
+result_path = result.images
+url_field = image_url
+```
+
 图像节点输出 `IMAGE`，可直接接视频节点的 `first_frame` / `reference_images`，无需转换：
 
 ```

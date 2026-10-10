@@ -1007,6 +1007,36 @@ class CYAiImageGen:
                     {"default": "",
                      "tooltip": "协议配方：内置名 ark_seedream（火山方舟 doubao-seedream），或贴 recipe JSON / 填文件路径接入其它图像 API。留空 = 默认 ark_seedream"},
                 ),
+                "submit_url": (
+                    "STRING",
+                    {"default": "",
+                     "tooltip": "可选：提交接口地址（相对 base_url 或完整 URL）。留空用配方/内置默认；中转站端口不同时直接改这里，不必写整份 recipe"},
+                ),
+                "response_format": (
+                    ["url", "b64_json"],
+                    {"default": "url",
+                     "tooltip": "返回格式：url = 临时下载链接，b64_json = base64 内嵌。按中转站支持情况选"},
+                ),
+                "extra_body": (
+                    "STRING",
+                    {"multiline": True, "default": "",
+                     "tooltip": "可选：额外请求体字段（JSON 对象），合并进请求体并覆盖同名字段。中转站字段命名/结构与默认不同时，在这里自由声明任意字段，如 {\"width\": 1024, \"height\": 1024, \"cfg_scale\": 7.5}"},
+                ),
+                "url_field": (
+                    "STRING",
+                    {"default": "url",
+                     "tooltip": "响应里图片 URL 的字段名（图片项内）。中转站命名不同时改，如 url / image_url / link"},
+                ),
+                "b64_field": (
+                    "STRING",
+                    {"default": "b64_json",
+                     "tooltip": "响应里图片 base64 的字段名（图片项内），如 b64_json / base64 / image_b64"},
+                ),
+                "result_path": (
+                    "STRING",
+                    {"default": "data",
+                     "tooltip": "响应里图片数组的字段路径（点路径），如 data / result.images / output。也支持直接指向字符串 URL 或字符串数组"},
+                ),
             },
         }
 
@@ -1018,7 +1048,9 @@ class CYAiImageGen:
     DESCRIPTION = "通用图像生成（recipe 驱动），默认火山方舟 doubao-seedream，输出 IMAGE"
 
     def generate(self, api_key, base_url, model, prompt, size,
-                 image=None, seed=-1, watermark=False, recipe=""):
+                 image=None, seed=-1, watermark=False, recipe="",
+                 submit_url="", response_format="url", extra_body="",
+                 url_field="url", b64_field="b64_json", result_path="data"):
         api_key = (api_key or "").strip()
         prompt = (prompt or "").strip()
         if not api_key:
@@ -1037,10 +1069,15 @@ class CYAiImageGen:
         headers = {k: _render_template(v, {"api_key": api_key})
                    for k, v in (auth_cfg.get("headers") or {}).items()}
 
-        # 提交地址 + 请求体模板
+        # 提交地址：显式 submit_url > 配方 submit.url > 内置默认
         submit = r.get("submit") or {}
         method = submit.get("method", "POST")
-        url = _resolve_url(base, _render_template(submit.get("url") or "", {"base_url": base}))
+        if (submit_url or "").strip():
+            url = _resolve_url(base, (submit_url or "").strip())
+        elif submit.get("url"):
+            url = _resolve_url(base, _render_template(submit.get("url"), {"base_url": base}))
+        else:
+            url = _resolve_url(base, "/api/v3/images/generations")
         body_template = submit.get("body") or "{}"
 
         # 通用标量占位符
@@ -1050,7 +1087,7 @@ class CYAiImageGen:
             "size": _json_str(size),
             "seed": str(int(seed)),
             "watermark": "true" if watermark else "false",
-            "response_format": _json_str("url"),
+            "response_format": _json_str(response_format),
             "n": "1",
         }
 
@@ -1070,6 +1107,16 @@ class CYAiImageGen:
                 "请求体模板渲染后不是有效 JSON：%s；渲染结果：%s" % (e, body_str[:1500])) from e
         if image_val is not None:
             body[image_field] = image_val
+
+        # 自由字段：extra_body 是 JSON 对象，合并进请求体并覆盖同名字段
+        if (extra_body or "").strip():
+            try:
+                extra = json.loads(extra_body)
+            except json.JSONDecodeError as e:
+                raise RuntimeError("extra_body 不是有效 JSON：%s" % e) from e
+            if not isinstance(extra, dict):
+                raise RuntimeError("extra_body 必须是 JSON 对象（{...}）")
+            body.update(extra)
 
         resp = _http_json(method, url, headers, body, timeout=180.0)
 
@@ -1100,28 +1147,39 @@ class CYAiImageGen:
             else:
                 raise RuntimeError("图像生成轮询超时")
 
-        # 解析图片：result_path 指向 data 数组（每项 url 或 b64_json）
-        result_path = r.get("result_path") or "data"
-        items = _resolve_field(resp, result_path)
-        if not isinstance(items, list):
-            if isinstance(items, dict):
-                items = [items]
-            elif isinstance(items, str) and items:
-                items = [{"url": items}]
-            else:
-                raise RuntimeError("响应里找不到图像（路径 %s）：%s" % (result_path, resp))
+        # 解析图片：result_path 指向图片数组（每项 url 或 b64）；字段名可配
+        result_path = (result_path or "").strip() or (r.get("result_path") or "data")
+        url_field = (url_field or "").strip() or (r.get("url_field") or "url")
+        b64_field = (b64_field or "").strip() or (r.get("b64_field") or "b64_json")
+        raw = _resolve_field(resp, result_path)
+        if raw is None:
+            raise RuntimeError("响应里找不到图像（路径 %s）：%s" % (result_path, resp))
+
+        # 归一成列表：dict -> [dict]，str -> [url]，list 保持
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict):
+            items = [raw]
+        elif isinstance(raw, str):
+            items = [raw]
+        else:
+            raise RuntimeError("图像字段结构无法识别（路径 %s）：%s" % (result_path, resp))
 
         frames = []
         for it in items:
-            if not isinstance(it, dict):
-                raise RuntimeError("图像项结构异常：%s" % it)
-            b64 = it.get("b64_json")
-            if b64:
-                frames.append(_image_from_bytes(base64.b64decode(b64)))
-            elif it.get("url"):
-                frames.append(_image_from_bytes(_download(it["url"], headers)))
+            if isinstance(it, str):                      # 直接是 URL 字符串
+                frames.append(_image_from_bytes(_download(it, headers)))
+            elif isinstance(it, dict):
+                b64 = it.get(b64_field) or it.get("b64_json")
+                u = it.get(url_field) or it.get("url")
+                if b64:
+                    frames.append(_image_from_bytes(base64.b64decode(b64)))
+                elif u:
+                    frames.append(_image_from_bytes(_download(u, headers)))
+                else:
+                    raise RuntimeError("图像项既无 %s 也无 %s：%s" % (url_field, b64_field, it))
             else:
-                raise RuntimeError("图像项既无 url 也无 b64_json：%s" % it)
+                raise RuntimeError("图像项结构异常：%s" % it)
         if not frames:
             raise RuntimeError("未解析出任何图像")
 
