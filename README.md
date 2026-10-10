@@ -149,6 +149,8 @@ body 模板里用占位符拼 JSON，节点按类型替换：
 | `result_path` | 响应里图片数组的字段路径（点路径），如 `data` / `result.images` / `output`；也支持直接指向字符串 URL 或字符串数组 |
 | `url_field` | 图片项内 URL 的字段名，默认 `url`（改 `image_url` / `link` 等） |
 | `b64_field` | 图片项内 base64 的字段名，默认 `b64_json`（改 `base64` / `image_b64` 等） |
+| `image_field` | 图生图参考字段名（请求体里承载参考图的字段），默认 `image`（改 `init_image` / `input_image` / `image_url` 等） |
+| `n` | 一次生成张数，默认 1（部分中转站支持一次多张） |
 
 示例：接一个字段完全不同的中转站（端口 `/v1/txt2img`、请求体用 `width`/`height`、响应是 `result.images[].image_url`）：
 

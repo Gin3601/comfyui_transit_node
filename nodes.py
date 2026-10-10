@@ -441,7 +441,7 @@ ARK_SEEDREAM_RECIPE = {
         "url": "{base_url}/api/v3/images/generations",
         "body": (
             '{"model": {model}, "prompt": {prompt}, "size": {size}, '
-            '"seed": {seed}, "watermark": {watermark}, "response_format": {response_format}}'
+            '"seed": {seed}, "watermark": {watermark}, "response_format": {response_format}, "n": {n}}'
         ),
     },
     "image_field": "image",
@@ -1037,6 +1037,16 @@ class CYAiImageGen:
                     {"default": "data",
                      "tooltip": "响应里图片数组的字段路径（点路径），如 data / result.images / output。也支持直接指向字符串 URL 或字符串数组"},
                 ),
+                "image_field": (
+                    "STRING",
+                    {"default": "image",
+                     "tooltip": "图生图参考字段名（请求体里承载参考图的字段）。中转站命名不同时改，如 image / init_image / input_image / image_url"},
+                ),
+                "n": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 10, "step": 1,
+                     "tooltip": "一次生成张数（n）。部分中转站支持一次多张；不支持的中转站会忽略或报错，保持 1 即可"},
+                ),
             },
         }
 
@@ -1050,7 +1060,8 @@ class CYAiImageGen:
     def generate(self, api_key, base_url, model, prompt, size,
                  image=None, seed=-1, watermark=False, recipe="",
                  submit_url="", response_format="url", extra_body="",
-                 url_field="url", b64_field="b64_json", result_path="data"):
+                 url_field="url", b64_field="b64_json", result_path="data",
+                 image_field="image", n=1):
         api_key = (api_key or "").strip()
         prompt = (prompt or "").strip()
         if not api_key:
@@ -1088,11 +1099,11 @@ class CYAiImageGen:
             "seed": str(int(seed)),
             "watermark": "true" if watermark else "false",
             "response_format": _json_str(response_format),
-            "n": "1",
+            "n": str(int(n)),
         }
 
-        # 图生图：image 字段（字段名 recipe 可配，默认 image），单图=字符串、多图=数组
-        image_field = r.get("image_field") or "image"
+        # 图生图：image 字段名（显式参数 > recipe > 默认），单图=字符串、多图=数组
+        image_field = (image_field or "").strip() or (r.get("image_field") or "image")
         image_val = None
         if image is not None:
             imgs = image if image.dim() == 4 else image.unsqueeze(0)
